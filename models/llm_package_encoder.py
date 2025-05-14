@@ -1,411 +1,294 @@
+# Enhanced LLMPackageEncoder with fallback title generation
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
-import os
-import requests
+from typing import List, Optional, Dict, Any
 import json
+import os
 import time
-from typing import Dict, List, Optional
+from openai import OpenAI
+import pickle
 from tqdm import tqdm
 
-class LLMPackageEncoder(nn.Module):
+
+class LLMPackageEncoders(nn.Module):
     """
-    Package Encoder that uses LLM (ChatGPT) for title embeddings
-    
-    This encoder uses the OpenAI API to generate embeddings for package titles.
+    Enhanced Package encoder using LLM embeddings with fallback title generation
     """
-    def __init__(self, 
-                package_vocab_size: int, 
-                country_vocab_size: int, 
-                category_vocab_size: int, 
-                theme_vocab_size: int, 
-                embedding_dim: int = 256,
-                hidden_dim: int = 256,
-                api_key: Optional[str] = None,
-                embedding_model: str = "text-embedding-3-large",
-                dropout: float = 0.2,
-                cache_dir: str = "data/cache/llm_embeddings"):
-        super(LLMPackageEncoder, self).__init__()
+    def __init__(
+        self,
+        package_vocab_size: int,
+        country_vocab_size: int,
+        category_vocab_size: int,
+        theme_vocab_size: int,
+        projection_dim: int = 256,
+        api_key: Optional[str] = None,
+        embedding_model: str = "text-embedding-3-large",
+        cache_dir: str = "data/cache/llm_embeddings",
+        embedding_dim: int = 3072,  # Default for text-embedding-3-large
+    ):
+        super().__init__()
         
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.projection_dim = projection_dim
         self.embedding_model = embedding_model
+        self.cache_dir = cache_dir
+        self.embedding_dim = embedding_dim
         
         # Create cache directory
-        self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
         
-        # Check if API key is available
-        if not self.api_key:
-            raise ValueError("OpenAI API key is required. Set it as OPENAI_API_KEY environment variable or pass it to the constructor.")
-        
-        # Determine LLM embedding dimension based on model
-        if embedding_model == "text-embedding-3-small":
-            self.llm_embedding_dim = 1536
-        elif embedding_model == "text-embedding-3-large":
-            self.llm_embedding_dim = 3072
-        elif embedding_model == "text-embedding-ada-002":
-            self.llm_embedding_dim = 1536
+        # Initialize OpenAI client
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        if self.api_key:
+            self.client = OpenAI(api_key=self.api_key)
         else:
-            self.llm_embedding_dim = 1536  # Default
+            print("Warning: No OpenAI API key provided. LLM embeddings will not be available.")
+            self.client = None
         
-        # Linear layer to transform LLM embeddings to our dimension
-        self.text_transform = nn.Linear(self.llm_embedding_dim, embedding_dim)
-        
-        # Embeddings for different package attributes
-        self.package_embeddings = nn.Embedding(package_vocab_size, embedding_dim, padding_idx=0)
-        self.country_embeddings = nn.Embedding(country_vocab_size, embedding_dim, padding_idx=0)
-        self.category_embeddings = nn.Embedding(category_vocab_size, embedding_dim, padding_idx=0)
-        self.theme_embeddings = nn.Embedding(theme_vocab_size, embedding_dim, padding_idx=0)
-        
-        # Bi-LSTM for title encoding
-        self.title_lstm = nn.LSTM(
-            embedding_dim, 
-            hidden_dim // 2,
-            batch_first=True, 
-            bidirectional=True
-        )
-        
-        # MLPs for different views
-        self.destination_mlp = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim),
+        # Projection layers for LLM embeddings
+        self.llm_projection = nn.Sequential(
+            nn.Linear(self.embedding_dim, 512),
             nn.ReLU(),
-            nn.Dropout(dropout)
+            nn.Dropout(0.1),
+            nn.Linear(512, projection_dim)
         )
         
-        self.category_mlp = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
+        # Load or initialize embedding cache
+        self.cache_file = os.path.join(self.cache_dir, f"{embedding_model}_cache.json")
+        self.embedding_cache = self._load_embedding_cache()
         
-        self.theme_mlp = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        
-        # View-level attention weights
-        self.view_attention_query = nn.Parameter(torch.zeros(hidden_dim))
-        self.view_attention = nn.Linear(hidden_dim, hidden_dim)
-        
-        self.dropout = nn.Dropout(dropout)
-        
-        # Load cached embeddings if available
-        self.embedding_cache = {}
-        self._load_embedding_cache()
-        
-        # Add API call tracking for cost management
-        self.api_call_count = 0
-        self.api_call_tokens = 0
+        print(f"Loaded {len(self.embedding_cache)} cached embeddings from {self.cache_file}")
     
-    def _load_embedding_cache(self):
-        """Load cached embeddings from disk"""
-        cache_file = os.path.join(self.cache_dir, f"{self.embedding_model}_cache.json")
-        if os.path.exists(cache_file):
+    def _load_embedding_cache(self) -> Dict[str, List[float]]:
+        """Load cached embeddings from file"""
+        if os.path.exists(self.cache_file):
             try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    # JSON doesn't support numpy arrays directly, so we store as lists
-                    cache_data = json.load(f)
-                    for key, value in cache_data.items():
-                        self.embedding_cache[key] = np.array(value)
-                print(f"Loaded {len(self.embedding_cache)} cached embeddings from {cache_file}")
+                with open(self.cache_file, 'r') as f:
+                    cache = json.load(f)
+                    # Ensure all values are lists (not numpy arrays)
+                    return {k: v if isinstance(v, list) else v.tolist() for k, v in cache.items()}
             except Exception as e:
-                print(f"Error loading embedding cache: {e}")
+                print(f"Error loading cache: {e}")
+                return {}
+        return {}
     
     def _save_embedding_cache(self):
-        """Save embedding cache to disk"""
-        cache_file = os.path.join(self.cache_dir, f"{self.embedding_model}_cache.json")
+        """Save embedding cache to file"""
         try:
             # Convert numpy arrays to lists for JSON serialization
-            cache_data = {k: v.tolist() for k, v in self.embedding_cache.items()}
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f)
+            serializable_cache = {}
+            for k, v in self.embedding_cache.items():
+                if isinstance(v, np.ndarray):
+                    serializable_cache[k] = v.tolist()
+                else:
+                    serializable_cache[k] = v
+            
+            with open(self.cache_file, 'w') as f:
+                json.dump(serializable_cache, f)
+            
             print(f"Saved {len(self.embedding_cache)} embeddings to cache")
         except Exception as e:
-            print(f"Error saving embedding cache: {e}")
+            print(f"Error saving cache: {e}")
     
-    def get_package_embedding(self, title: str, main_id = None):
+    def _create_fallback_title(self, package_metadata: Dict[str, Any]) -> str:
         """
-        Get embedding for a package, prioritizing cache by main_id
+        Create a fallback title from package metadata
         
         Args:
-            title: Package title
-            main_id: Unique package identifier
-        
-        Returns:
-            Embedding vector
-        """
-        # Use main_id for cache key if provided, otherwise use title
-        cache_key = str(main_id) if main_id is not None else title
-        
-        # Check cache first
-        if cache_key in self.embedding_cache:
-            return self.embedding_cache[cache_key]
-        elif title in self.embedding_cache:
-            return self.embedding_cache[title]
-        
-        # Make API request with retry logic
-        max_retries = 5
-        retry_delay = 1  # starting delay in seconds
-        
-        for attempt in range(max_retries):
-            try:
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}"
-                }
-                
-                data = {
-                    "input": title,
-                    "model": self.embedding_model
-                }
-                
-                self.api_call_count += 1
-                self.api_call_tokens += len(title.split()) + 5  # Rough estimate
-                
-                response = requests.post(
-                    "https://api.openai.com/v1/embeddings",
-                    headers=headers,
-                    data=json.dumps(data)
-                )
-                
-                if response.status_code == 429:  # Rate limit exceeded
-                    if attempt < max_retries - 1:
-                        sleep_time = retry_delay * (2 ** attempt)  # Exponential backoff
-                        print(f"Rate limit exceeded. Retrying in {sleep_time} seconds...")
-                        time.sleep(sleep_time)
-                        continue
-                elif response.status_code != 200:
-                    print(f"API error: {response.status_code} - {response.text}")
-                    if attempt < max_retries - 1:
-                        sleep_time = retry_delay * (2 ** attempt)
-                        print(f"Retrying in {sleep_time} seconds...")
-                        time.sleep(sleep_time)
-                        continue
-                    else:
-                        # Return zeros as fallback after max retries
-                        print(f"Max retries reached, returning zero embedding")
-                        embedding = np.zeros(self.llm_embedding_dim)
-                else:
-                    embedding = np.array(response.json()["data"][0]["embedding"])
-                    
-                    # Update cache with both main_id and title as keys
-                    if main_id is not None:
-                        self.embedding_cache[str(main_id)] = embedding
-                    self.embedding_cache[title] = embedding
-                    
-                    # Save cache periodically (every 10 new embeddings)
-                    if len(self.embedding_cache) % 10 == 0:
-                        self._save_embedding_cache()
-                
-                return embedding
-                
-            except Exception as e:
-                print(f"Error getting embedding: {e}")
-                if attempt < max_retries - 1:
-                    sleep_time = retry_delay * (2 ** attempt)
-                    print(f"Retrying in {sleep_time} seconds...")
-                    time.sleep(sleep_time)
-                else:
-                    print(f"Max retries reached, returning zero embedding")
-                    # Return zeros as fallback
-                    return np.zeros(self.llm_embedding_dim)
-    
-    def process_batch_titles_optimized(self, titles, main_ids=None):
-        """
-        Process a batch of titles using LLM embeddings with batch API calls
-        
-        Args:
-            titles: List of title strings
-            main_ids: Optional list of main_ids for caching
-        
-        Returns:
-            torch.Tensor: Transformed embeddings
-        """
-        # Check cache first
-        uncached_titles = []
-        uncached_indices = []
-        cached_embeddings = []
-        
-        for i, title in enumerate(titles):
-            main_id = main_ids[i] if main_ids is not None else None
-            
-            # Check if we have this embedding cached (by main_id or title)
-            cache_key = str(main_id) if main_id is not None else title
-            if cache_key in self.embedding_cache:
-                cached_embeddings.append((i, self.embedding_cache[cache_key]))
-            elif title in self.embedding_cache:
-                cached_embeddings.append((i, self.embedding_cache[title]))
-            else:
-                uncached_titles.append(title)
-                uncached_indices.append(i)
-        
-        # If there are uncached titles, get their embeddings
-        if uncached_titles:
-            try:
-                # Use the batch API for efficiency
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}"
-                }
-                
-                # For large batches, process in chunks to avoid rate limits
-                max_batch_size = 20  # Adjust based on API limits
-                
-                for i in range(0, len(uncached_titles), max_batch_size):
-                    batch_titles = uncached_titles[i:i+max_batch_size]
-                    batch_indices = uncached_indices[i:i+max_batch_size]
-                    
-                    data = {
-                        "input": batch_titles,
-                        "model": self.embedding_model
-                    }
-                    
-                    self.api_call_count += 1
-                    # Rough estimate of total tokens
-                    self.api_call_tokens += sum(len(t.split()) for t in batch_titles) + 5 * len(batch_titles)
-                    
-                    response = requests.post(
-                        "https://api.openai.com/v1/embeddings",
-                        headers=headers,
-                        data=json.dumps(data)
-                    )
-                    
-                    if response.status_code == 200:
-                        for j, embedding_data in enumerate(response.json()["data"]):
-                            title = batch_titles[j]
-                            embedding = np.array(embedding_data["embedding"])
-                            
-                            # Cache by main_id (if provided) and title
-                            if main_ids is not None:
-                                main_id = main_ids[batch_indices[j]]
-                                cache_key = str(main_id)
-                                self.embedding_cache[cache_key] = embedding
-                            
-                            # Also cache by title
-                            self.embedding_cache[title] = embedding
-                    else:
-                        print(f"API error: {response.status_code} - {response.text}")
-                        # Fall back to zeros for all titles in this batch
-                        for title in batch_titles:
-                            self.embedding_cache[title] = np.zeros(self.llm_embedding_dim)
-                
-                # Save cache after processing batch
-                self._save_embedding_cache()
-                    
-            except Exception as e:
-                print(f"Error getting batch embeddings: {e}")
-                # Fall back to zeros for all uncached titles
-                for title in uncached_titles:
-                    self.embedding_cache[title] = np.zeros(self.llm_embedding_dim)
-        
-        # Combine all embeddings in the original order
-        all_embeddings = [None] * len(titles)
-        
-        # Add cached embeddings
-        for idx, emb in cached_embeddings:
-            all_embeddings[idx] = torch.tensor(emb, dtype=torch.float)
-        
-        # Add newly fetched embeddings
-        for i, orig_idx in enumerate(uncached_indices):
-            title = titles[orig_idx]
-            main_id = main_ids[orig_idx] if main_ids is not None else None
-            
-            # Get from cache (either by main_id or title)
-            cache_key = str(main_id) if main_id is not None else title
-            
-            if cache_key in self.embedding_cache:
-                embedding = self.embedding_cache[cache_key]
-            elif title in self.embedding_cache:
-                embedding = self.embedding_cache[title]
-            else:
-                # This shouldn't happen, but just in case
-                print(f"Warning: No embedding found for {title}")
-                embedding = np.zeros(self.llm_embedding_dim)
-            
-            all_embeddings[orig_idx] = torch.tensor(embedding, dtype=torch.float)
-        
-        # Stack embeddings
-        embeddings_tensor = torch.stack(all_embeddings)
-        
-        # Transform to our embedding dimension
-        transformed_embeddings = self.text_transform(embeddings_tensor)
-        
-        print(f"Processed {len(titles)} titles: {len(cached_embeddings)} from cache, {len(uncached_titles)} from API")
-        
-        return transformed_embeddings
-    
-    def process_batch_titles(self, titles, main_ids=None):
-        """
-        Process a batch of titles using LLM embeddings
-        
-        Args:
-            titles: List of title strings
-            main_ids: Optional list of main_ids for caching
+            package_metadata: Dictionary containing package information
             
         Returns:
-            Embeddings tensor
+            Fallback title string
         """
-        # Use the optimized version
-        return self.process_batch_titles_optimized(titles, main_ids)
-    
-    def forward(self, titles, country_ids, category_ids, theme_ids, user_query=None):
-        """
-        Forward pass of the LLM-based package encoder
+        parts = []
         
-        Args:
-            titles: List of title strings
-            country_ids: Tensor of country indices
-            category_ids: Tensor of category indices
-            theme_ids: Tensor of theme indices
-            user_query: Optional user representation for personalized attention
-            
-        Returns:
-            Package representation vector
-        """
-        batch_size = len(titles)
-        device = country_ids.device
+        # Add theme
+        theme = package_metadata.get('theme', '').strip()
+        if theme and theme != 'Unknown':
+            parts.append(theme)
         
-        # Title encoding with LLM
-        title_embeddings = self.process_batch_titles(titles).to(device)
+        # Add category
+        category = package_metadata.get('category', '').strip()
+        if category and category != 'Unknown':
+            parts.append(category)
         
-        # Get contextual title representation using Bi-LSTM
-        title_outputs, _ = self.title_lstm(title_embeddings.unsqueeze(1))
-        title_representation = title_outputs.squeeze(1)
+        # Add location
+        location_parts = []
+        city = package_metadata.get('city', '').strip()
+        if city and city != 'Unknown':
+            location_parts.append(city)
         
-        # Destination (country) encoding
-        country_embedded = self.country_embeddings(country_ids)
-        country_representation = self.destination_mlp(country_embedded)
+        country = package_metadata.get('country', '').strip()
+        if country and country != 'Unknown':
+            location_parts.append(country)
         
-        # Category encoding
-        category_embedded = self.category_embeddings(category_ids)
-        category_representation = self.category_mlp(category_embedded)
+        if location_parts:
+            parts.append(f"in {', '.join(location_parts)}")
         
-        # Theme encoding
-        theme_embedded = self.theme_embeddings(theme_ids)
-        theme_representation = self.theme_mlp(theme_embedded)
-        
-        # Stack all representations
-        view_representations = torch.stack([
-            title_representation, 
-            country_representation, 
-            category_representation, 
-            theme_representation
-        ], dim=1)
-        
-        # View-level attention
-        if user_query is not None:
-            attention_query = user_query.unsqueeze(1)
+        if parts:
+            fallback_title = " - ".join(parts)
         else:
-            attention_query = self.view_attention_query.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1)
+            # Last resort: use main_id
+            main_id = package_metadata.get('main_id', 'Unknown')
+            fallback_title = f"Travel Package {main_id}"
+        
+        return fallback_title
+    
+    def get_embedding(self, text: str, cache_key: Optional[str] = None) -> Optional[np.ndarray]:
+        """
+        Get embedding for a single text with caching
+        
+        Args:
+            text: Text to embed
+            cache_key: Optional cache key (defaults to text)
             
-        view_attn_weights = torch.bmm(attention_query, view_representations.transpose(1, 2)).squeeze(1)
-        view_attn_weights = F.softmax(view_attn_weights, dim=1).unsqueeze(1)
+        Returns:
+            Embedding array or None if failed
+        """
+        if not self.client:
+            return None
         
-        # Apply view-level attention weights
-        package_representation = torch.bmm(view_attn_weights, view_representations).squeeze(1)
+        # Use text as cache key if not provided
+        if cache_key is None:
+            cache_key = text
         
-        return package_representation
+        # Check cache
+        if cache_key in self.embedding_cache:
+            embedding = self.embedding_cache[cache_key]
+            if isinstance(embedding, list):
+                return np.array(embedding)
+            return embedding
+        
+        try:
+            # Get embedding from OpenAI
+            response = self.client.embeddings.create(
+                input=text,
+                model=self.embedding_model
+            )
+            
+            embedding = np.array(response.data[0].embedding)
+            
+            # Cache the embedding
+            self.embedding_cache[cache_key] = embedding
+            
+            return embedding
+            
+        except Exception as e:
+            print(f"Error getting embedding for '{text[:50]}...': {e}")
+            return None
+    
+    def process_batch_packages(self, package_data: List[Dict[str, Any]]) -> torch.Tensor:
+        """
+        Process a batch of packages, handling empty titles with fallbacks
+        
+        Args:
+            package_data: List of package metadata dictionaries
+            
+        Returns:
+            Tensor of embeddings
+        """
+        embeddings = []
+        
+        for package in package_data:
+            main_id = str(package.get('main_id', ''))
+            title = package.get('title' or '').strip()
+            
+            # Check if title is empty
+            if not title:
+                # Create fallback title
+                fallback_title = self._create_fallback_title(package)
+                print(f"Empty title for package {main_id}, using fallback: '{fallback_title}'")
+                title = fallback_title
+            
+            # Try to get embedding (check cache first by main_id, then by title)
+            embedding = None
+            
+            # Check cache by main_id first
+            if main_id in self.embedding_cache:
+                embedding = self.embedding_cache[main_id]
+            
+            # If not found, try by title
+            if embedding is None and title in self.embedding_cache:
+                embedding = self.embedding_cache[title]
+            
+            # If still not found, generate new embedding
+            if embedding is None:
+                embedding = self.get_embedding(title, cache_key=main_id)
+            
+            if embedding is not None:
+                if isinstance(embedding, list):
+                    embedding = np.array(embedding)
+                embeddings.append(embedding)
+            else:
+                # Use zero embedding as last resort
+                print(f"Failed to get embedding for {main_id}, using zero embedding")
+                embeddings.append(np.zeros(self.embedding_dim))
+        
+        # Convert to tensor
+        embeddings_tensor = torch.tensor(np.array(embeddings), dtype=torch.float)
+        
+        # Apply projection layer
+        projected = self.llm_projection(embeddings_tensor)
+        
+        return projected
+    
+    def process_batch_titles(self, titles: List[str], main_ids: List[str], 
+                           package_metadata: Optional[List[Dict[str, Any]]] = None) -> torch.Tensor:
+        """
+        Process a batch of titles with fallback support
+        
+        Args:
+            titles: List of titles
+            main_ids: List of main IDs
+            package_metadata: Optional list of full package metadata for fallback generation
+            
+        Returns:
+            Tensor of embeddings (not projected)
+        """
+        embeddings = []
+        batch_size = 20
+        
+        for idx, (title, main_id) in enumerate(zip(titles, main_ids)):
+            main_id_str = str(main_id)
+            
+            # Handle empty title
+            if not title.strip():
+                if package_metadata and idx < len(package_metadata):
+                    # Use package metadata to create fallback
+                    fallback_title = self._create_fallback_title(package_metadata[idx])
+                    print(f"Empty title for {main_id_str}, using fallback: '{fallback_title}'")
+                    title = fallback_title
+                else:
+                    # Basic fallback
+                    title = f"Travel Package {main_id_str}"
+                    print(f"Empty title for {main_id_str}, using basic fallback: '{title}'")
+            
+            # Get embedding
+            embedding = self.get_embedding(title, cache_key=main_id_str)
+            
+            if embedding is not None:
+                embeddings.append(embedding)
+            else:
+                print(f"Failed to get embedding for {main_id_str}, using zero embedding")
+                embeddings.append(np.zeros(self.embedding_dim))
+        
+        # Save cache periodically
+        if len(embeddings) % 100 == 0:
+            self._save_embedding_cache()
+        
+        return torch.tensor(np.array(embeddings), dtype=torch.float)
+    
+    def forward(self, package_data: List[Dict[str, Any]]) -> torch.Tensor:
+        """
+        Forward pass
+        
+        Args:
+            package_data: List of package metadata dictionaries
+            
+        Returns:
+            Projected embeddings tensor
+        """
+        return self.process_batch_packages(package_data)
+
+
