@@ -180,3 +180,4 @@ cython_debug/
 .pypirc
 /data/
 /output/
+/checkpoints/

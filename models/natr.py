@@ -1,294 +1,326 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Optional, Tuple
 
-class NATR(nn.Module):
-    """
-    Neural Attentive Travel Recommendation (NATR) model
-    
-    An improved version that handles empty short-term packages with a special token
-    and incorporates attention mechanisms for better recommendation quality.
-    """
-    def __init__(self, 
-                num_users, 
-                num_packages,
-                num_countries,
-                num_categories,
-                num_themes,
-                embedding_dim=128, 
-                hidden_dim=256,
-                dropout=0.2,
-                empty_token=2):
-        """
-        Initialize the NATR model
-        
-        Args:
-            num_users: Number of users in the dataset
-            num_packages: Number of travel packages in the dataset
-            num_countries: Number of countries in the dataset
-            num_categories: Number of categories in the dataset
-            num_themes: Number of themes in the dataset
-            embedding_dim: Dimension of the embedding vectors
-            hidden_dim: Dimension of the hidden layers
-            dropout: Dropout rate
-            empty_token: Special token for empty short-term packages
-        """
-        super(NATR, self).__init__()
-        
-        self.embedding_dim = embedding_dim
+class ViewLevelAttention(nn.Module):
+    """View-level attention mechanism with optimized implementation"""
+    def __init__(self, hidden_dim: int):
+        super().__init__()
         self.hidden_dim = hidden_dim
-        self.empty_token = empty_token
+        # Use weight tying (in_features = out_features)
+        self.attention_project = nn.Linear(hidden_dim, hidden_dim//2)
+        self.attention_weights = nn.Linear(hidden_dim//2, 1)
         
-        # Embedding layers
-        self.user_embedding = nn.Embedding(num_users + 1, embedding_dim, padding_idx=0)
-        self.package_embedding = nn.Embedding(num_packages + 1, embedding_dim, padding_idx=0)
-        self.country_embedding = nn.Embedding(num_countries + 1, embedding_dim, padding_idx=0)
-        self.category_embedding = nn.Embedding(num_categories + 1, embedding_dim, padding_idx=0)
-        self.theme_embedding = nn.Embedding(num_themes + 1, embedding_dim, padding_idx=0)
+    def forward(self, views: list) -> torch.Tensor:
+        """Apply attention across different views with improved efficiency"""
+        # Batch concatenation is more efficient than stack+sum
+        stacked_views = torch.stack(views, dim=2)  # [batch_size, seq_len, num_views, hidden_dim]
         
-        # Special embedding for empty short-term token
-        self.empty_embedding = nn.Parameter(torch.randn(1, embedding_dim))
+        # Use projection before attention to reduce computation
+        projected_views = torch.relu(self.attention_project(stacked_views))  # Add non-linearity
+        attention_scores = self.attention_weights(projected_views).squeeze(-1)
         
-        # LSTM layers for sequence processing
+        # Stable softmax with better numerical precision
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        
+        # Use bmm for more efficient batch multiplication
+        attention_weights_expanded = attention_weights.unsqueeze(3)  # [batch_size, seq_len, num_views, 1]
+        attended = (stacked_views * attention_weights_expanded).sum(dim=2)
+        
+        return attended
+
+
+class PackageEncoder(nn.Module):
+    """Package encoder with event awareness"""
+    def __init__(self, config):
+        super().__init__()
+        
+        # Title encoder
+        self.title_encoder = nn.Sequential(
+            nn.Linear(config.title_embedding_dim, config.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.hidden_dim)
+        )
+        
+        # Coordinate encoder
+        self.coordinate_encoder = nn.Sequential(
+            nn.Linear(2, 64),
+            nn.ReLU(),
+            nn.Linear(64, config.hidden_dim)
+        )
+        
+        # Category embeddings
+        self.country_embedding = nn.Embedding(config.num_countries, config.embedding_dim, padding_idx=0)
+        self.category_embedding = nn.Embedding(config.num_categories, config.embedding_dim, padding_idx=0)
+        self.theme_embedding = nn.Embedding(config.num_themes, config.embedding_dim, padding_idx=0)
+        
+        self.category_encoder = nn.Sequential(
+            nn.Linear(config.embedding_dim * 3, config.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.hidden_dim)
+        )
+        
+        # Event type embedding for natural learning
+        self.event_embedding = nn.Embedding(5, 32, padding_idx=0)  # 5 event types
+        self.event_projection = nn.Linear(32, config.hidden_dim)
+        
+        # View-level attention
+        self.view_attention = ViewLevelAttention(config.hidden_dim)
+    
+    def forward(self, batch_data: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward pass with event awareness"""
+        # Handle dimensions
+        if len(batch_data['title_embeddings'].shape) == 2:
+            # Single package case
+            batch_size = batch_data['title_embeddings'].size(0)
+            seq_len = 1
+            
+            title_repr = self.title_encoder(batch_data['title_embeddings']).unsqueeze(1)
+            coord_repr = self.coordinate_encoder(batch_data['coordinates']).unsqueeze(1)
+            
+            country_emb = self.country_embedding(batch_data['country_ids']).unsqueeze(1)
+            category_emb = self.category_embedding(batch_data['category_ids']).unsqueeze(1)
+            theme_emb = self.theme_embedding(batch_data['theme_ids']).unsqueeze(1)
+            
+            # Event embeddings if available
+            if 'event_types' in batch_data:
+                event_emb = self.event_embedding(batch_data['event_types']).unsqueeze(1)
+            else:
+                event_emb = torch.zeros(batch_size, 1, 32, device=batch_data['title_embeddings'].device)
+            
+        else:
+            # Sequence case
+            batch_size, seq_len, _ = batch_data['title_embeddings'].shape
+            
+            title_flat = batch_data['title_embeddings'].view(-1, batch_data['title_embeddings'].size(-1))
+            coord_flat = batch_data['coordinates'].view(-1, 2)
+            
+            title_repr = self.title_encoder(title_flat).view(batch_size, seq_len, -1)
+            coord_repr = self.coordinate_encoder(coord_flat).view(batch_size, seq_len, -1)
+            
+            country_emb = self.country_embedding(batch_data['country_ids'])
+            category_emb = self.category_embedding(batch_data['category_ids'])
+            theme_emb = self.theme_embedding(batch_data['theme_ids'])
+            
+            # Event embeddings
+            if 'event_types' in batch_data:
+                event_emb = self.event_embedding(batch_data['event_types'])
+            else:
+                event_emb = torch.zeros(batch_size, seq_len, 32, device=batch_data['title_embeddings'].device)
+        
+        # Combine categorical embeddings
+        cat_combined = torch.cat([country_emb, category_emb, theme_emb], dim=-1)
+        cat_repr = self.category_encoder(cat_combined.view(-1, cat_combined.size(-1))).view(batch_size, seq_len, -1)
+        
+        # Add event information (let model learn importance)
+        event_repr = self.event_projection(event_emb)
+        title_repr = title_repr + 0.1 * event_repr  # Small initial contribution
+        
+        # Apply view-level attention
+        views = [title_repr, coord_repr, cat_repr]
+        unified_repr = self.view_attention(views)
+        
+        return unified_repr.squeeze(1) if seq_len == 1 else unified_repr
+
+
+class PackageLevelAttention(nn.Module):
+    """Package-level attention mechanism with optimized implementation"""
+    def __init__(self, hidden_dim: int, user_embedding_dim: int):
+        super().__init__()
+        # Use more efficient two-step attention calculation
+        self.query_projection = nn.Linear(user_embedding_dim, hidden_dim)
+        self.key_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.scale_factor = hidden_dim ** 0.5  # Scaling for dot-product attention
+        
+    def forward(self, 
+                sequence_output: torch.Tensor,
+                user_embedding: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        
+        batch_size, seq_len, hidden_dim = sequence_output.shape
+        
+        # Project user embedding to create query vectors
+        query = self.query_projection(user_embedding).unsqueeze(1)  # [batch_size, 1, hidden_dim]
+        
+        # Project sequence outputs to create key vectors
+        key = self.key_projection(sequence_output)  # [batch_size, seq_len, hidden_dim]
+        
+        # Compute scaled dot-product attention
+        attention_scores = torch.bmm(query, key.transpose(1, 2)).squeeze(1) / self.scale_factor
+        
+        # Apply mask if provided
+        if mask is not None:
+            attention_scores = attention_scores.masked_fill(mask == 0, -1e9)
+        
+        # Apply softmax to get attention weights
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        
+        # Compute weighted sum using batch matrix multiplication
+        attended = torch.bmm(attention_weights.unsqueeze(1), sequence_output).squeeze(1)
+        
+        return attended
+
+
+class UserEncoder(nn.Module):
+    """User encoder with Bi-LSTM and attention"""
+    def __init__(self, config):
+        super().__init__()
+        
+        self.user_embedding = nn.Embedding(config.num_users, config.user_embedding_dim, padding_idx=0)
+        
+        # Bi-LSTM layers
         self.short_term_lstm = nn.LSTM(
-            input_size=embedding_dim * 4,  # package + country + category + theme
-            hidden_size=hidden_dim,
+            input_size=config.hidden_dim,
+            hidden_size=config.hidden_dim // 2,
             batch_first=True,
-            bidirectional=True
+            bidirectional=True,
+            dropout=config.dropout if config.dropout > 0 else 0
         )
         
         self.long_term_lstm = nn.LSTM(
-            input_size=embedding_dim * 4,  # package + country + category + theme
-            hidden_size=hidden_dim,
+            input_size=config.hidden_dim,
+            hidden_size=config.hidden_dim // 2,
             batch_first=True,
-            bidirectional=True
+            bidirectional=True,
+            dropout=config.dropout if config.dropout > 0 else 0
         )
         
-        # Attention layers
-        self.word_level_attention = nn.Linear(hidden_dim * 2, 1)  # For bidirectional
-        self.view_level_attention = nn.Linear(hidden_dim * 2, 1)  # For bidirectional
-        self.package_level_attention = nn.Linear(hidden_dim * 2, 1)  # For bidirectional
+        # Package-level attention
+        self.package_attention = PackageLevelAttention(config.hidden_dim, config.user_embedding_dim)
+    
+    def forward(self, 
+                user_ids: torch.Tensor,
+                short_term_repr: torch.Tensor,
+                long_term_repr: torch.Tensor,
+                short_term_mask: Optional[torch.Tensor] = None,
+                long_term_mask: Optional[torch.Tensor] = None):
         
-        # Fusion layer for combining short-term and long-term preferences
+        # Get user embeddings
+        user_emb = self.user_embedding(user_ids)
+        
+        # Process sequences
+        short_term_output, _ = self.short_term_lstm(short_term_repr)
+        short_term_pref = self.package_attention(short_term_output, user_emb, short_term_mask)
+        
+        long_term_output, _ = self.long_term_lstm(long_term_repr)
+        long_term_pref = self.package_attention(long_term_output, user_emb, long_term_mask)
+        
+        return short_term_pref, long_term_pref, user_emb
+
+
+class GatedFusion(nn.Module):
+    """Gated fusion network"""
+    def __init__(self, config):
+        super().__init__()
+        
         self.fusion_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim * 2),  # (short_term + long_term) -> hidden
+            nn.Linear(config.hidden_dim * 2 + config.user_embedding_dim, config.hidden_dim),
             nn.Sigmoid()
         )
         
-        # Final prediction layers
-        self.prediction_layer = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+    def forward(self, 
+                short_term_pref: torch.Tensor,
+                long_term_pref: torch.Tensor,
+                user_embedding: torch.Tensor) -> torch.Tensor:
+        
+        combined = torch.cat([short_term_pref, long_term_pref, user_embedding], dim=-1)
+        gate = self.fusion_gate(combined)
+        fused = gate * long_term_pref + (1 - gate) * short_term_pref
+        
+        return fused
+
+
+class NATR(nn.Module):
+    """
+    NATR model with natural event learning capability
+    """
+    def __init__(self, config):
+        super().__init__()
+        
+        self.config = config
+        
+        # Encoders
+        self.package_encoder = PackageEncoder(config)
+        self.user_encoder = UserEncoder(config)
+        self.gated_fusion = GatedFusion(config)
+        
+        # Final prediction layer
+        self.prediction_head = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, embedding_dim)
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.num_packages)
+        )
+    
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Forward pass"""
+        
+        # Extract user IDs
+        user_ids = batch['user_id']
+        
+        # Encode packages with event information
+        short_term_repr = self.package_encoder(batch['short_term'])
+        long_term_repr = self.package_encoder(batch['long_term'])
+        
+        # Create masks
+        short_term_mask = (batch['short_term']['package_ids'] > 0).float()
+        long_term_mask = (batch['long_term']['package_ids'] > 0).float()
+        
+        # Encode user preferences
+        short_term_pref, long_term_pref, user_emb = self.user_encoder(
+            user_ids,
+            short_term_repr,
+            long_term_repr,
+            short_term_mask,
+            long_term_mask
         )
         
-        # Initialize weights
-        self._init_weights()
-    
-    def _init_weights(self):
-        """Initialize weights for the model"""
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                nn.init.xavier_uniform_(param)
-            elif 'bias' in name:
-                nn.init.zeros_(param)
-    
-    def _encode_package_sequence(self, package_ids, country_ids, category_ids, theme_ids, lstm_layer, attention_layer):
-        """Encode a sequence of packages using LSTM and attention"""
-        # Get embeddings
-        package_emb = self.package_embedding(package_ids)  # [batch_size, seq_len, embedding_dim]
-        country_emb = self.country_embedding(country_ids)  # [batch_size, seq_len, embedding_dim]
-        category_emb = self.category_embedding(category_ids)  # [batch_size, seq_len, embedding_dim]
-        theme_emb = self.theme_embedding(theme_ids)  # [batch_size, seq_len, embedding_dim]
+        # Fuse preferences
+        user_final_repr = self.gated_fusion(short_term_pref, long_term_pref, user_emb)
         
-        # Concatenate embeddings
-        sequence_emb = torch.cat([package_emb, country_emb, category_emb, theme_emb], dim=2)  # [batch_size, seq_len, 4*embedding_dim]
+        # Make predictions
+        predictions = self.prediction_head(user_final_repr)
         
-        # Create mask for padding (1 for real tokens, 0 for padding)
-        mask = (package_ids != 0).float().unsqueeze(-1)  # [batch_size, seq_len, 1]
-        
-        # Process through LSTM
-        lstm_out, _ = lstm_layer(sequence_emb)  # [batch_size, seq_len, 2*hidden_dim]
-        
-        # Apply attention
-        attention_scores = attention_layer(lstm_out)  # [batch_size, seq_len, 1]
-        attention_scores = attention_scores.masked_fill((1 - mask).bool(), -1e9)  # Apply mask
-        attention_weights = F.softmax(attention_scores, dim=1)  # [batch_size, seq_len, 1]
-        
-        # Weight sequence by attention
-        weighted_output = lstm_out * attention_weights  # [batch_size, seq_len, 2*hidden_dim]
-        sequence_representation = weighted_output.sum(dim=1)  # [batch_size, 2*hidden_dim]
-        
-        return sequence_representation, attention_weights
-    
-    def forward(self, batch):
-        """
-        Forward pass through the NATR model
-        
-        Args:
-            batch: Dictionary containing user and package data
-                - user_id: User IDs tensor [batch_size]
-                - has_short_term: Boolean tensor indicating if short-term is present [batch_size]
-                - short_term: Dictionary containing short-term package data
-                    - package_ids: Package IDs tensor [batch_size, max_short_term]
-                    - country_ids: Country IDs tensor [batch_size, max_short_term]
-                    - category_ids: Category IDs tensor [batch_size, max_short_term]
-                    - theme_ids: Theme IDs tensor [batch_size, max_short_term]
-                - long_term: Dictionary containing long-term package data (same structure)
-                - purchased: Dictionary containing purchased package data (without sequence dimension)
-                
-        Returns:
-            Dictionary containing model outputs
-                - scores: Recommendation scores [batch_size, num_packages]
-                - user_representation: User representation [batch_size, embedding_dim]
-                - short_term_attention: Attention weights for short-term packages [batch_size, max_short_term, 1]
-                - long_term_attention: Attention weights for long-term packages [batch_size, max_long_term, 1]
-                - fusion_weights: Fusion weights for short-term and long-term [batch_size, hidden_dim * 2]
-        """
-        user_id = batch['user_id']
-        has_short_term = batch.get('has_short_term', None)
-        
-        # Process short-term packages
-        if has_short_term is not None:
-            # If has_short_term flag is provided, handle empty short-term
-            short_term_representation = torch.zeros(
-                user_id.size(0), self.hidden_dim * 2, device=user_id.device
-            )
-            short_term_attention = None
-            
-            # Process users with short-term data
-            if has_short_term.any():
-                # Get indices of users with short-term data
-                has_st_indices = has_short_term.nonzero(as_tuple=True)[0]
-                
-                # Extract short-term data for these users
-                st_pkg_ids = batch['short_term']['package_ids'][has_st_indices]
-                st_country_ids = batch['short_term']['country_ids'][has_st_indices]
-                st_category_ids = batch['short_term']['category_ids'][has_st_indices]
-                st_theme_ids = batch['short_term']['theme_ids'][has_st_indices]
-                
-                # Check for special token (empty short-term marked with token)
-                empty_token_mask = (st_pkg_ids == self.empty_token)
-                if empty_token_mask.any():
-                    # Replace special token with a learnable embedding
-                    st_representation, st_attention = self._encode_package_sequence(
-                        st_pkg_ids, st_country_ids, st_category_ids, st_theme_ids,
-                        self.short_term_lstm, self.package_level_attention
-                    )
-                    short_term_representation[has_st_indices] = st_representation
-                    
-                    if short_term_attention is None:
-                        short_term_attention = torch.zeros(
-                            user_id.size(0), st_attention.size(1), 1, device=user_id.device
-                        )
-                    short_term_attention[has_st_indices] = st_attention
-            
-            # For users without short-term, leave representation as zeros
-        else:
-            # Process all short-term packages if no has_short_term flag
-            short_term_representation, short_term_attention = self._encode_package_sequence(
-                batch['short_term']['package_ids'],
-                batch['short_term']['country_ids'],
-                batch['short_term']['category_ids'],
-                batch['short_term']['theme_ids'],
-                self.short_term_lstm,
-                self.package_level_attention
-            )
-        
-        # Process long-term packages
-        long_term_representation, long_term_attention = self._encode_package_sequence(
-            batch['long_term']['package_ids'],
-            batch['long_term']['country_ids'],
-            batch['long_term']['category_ids'],
-            batch['long_term']['theme_ids'],
-            self.long_term_lstm,
-            self.package_level_attention
-        )
-        
-        # Combine short-term and long-term preferences with gated fusion
-        combined_input = torch.cat([short_term_representation, long_term_representation], dim=1)
-        fusion_weights = self.fusion_gate(combined_input)
-        
-        # Apply weighted fusion
-        user_representation = (1 - fusion_weights) * short_term_representation + fusion_weights * long_term_representation
-        
-        # Get user's final prediction vector
-        user_vector = self.prediction_layer(user_representation)
-        
-        # Calculate scores with all packages (can be done more efficiently in the loss function)
-        all_packages = self.package_embedding.weight
-        scores = torch.matmul(user_vector, all_packages.t())
+        # Encode purchased package
+        purchased_repr = self.package_encoder(batch['purchased'])
         
         return {
-            'scores': scores,
-            'user_representation': user_vector,
-            'short_term_attention': short_term_attention,
-            'long_term_attention': long_term_attention,
-            'fusion_weights': fusion_weights
+            'predictions': predictions,
+            'user_representation': user_final_repr,
+            'purchased_representation': purchased_repr,
+            'short_term_preference': short_term_pref,
+            'long_term_preference': long_term_pref
         }
-    
-    def calculate_loss(self, batch, output, negative_samples=5):
-        """
-        Calculate the BPR loss for the model
+
+
+class NATRConfig:
+    """Configuration for NATR model"""
+    def __init__(self,
+                 num_users: int,
+                 num_packages: int,
+                 num_countries: int,
+                 num_categories: int,
+                 num_themes: int,
+                 title_embedding_dim: int = 3072,
+                 hidden_dim: int = 256,
+                 embedding_dim: int = 128,
+                 user_embedding_dim: int = 128,
+                 dropout: float = 0.2,
+                 max_short_term: int = 10,
+                 max_long_term: int = 20):
         
-        Args:
-            batch: Input batch data
-            output: Model output
-            negative_samples: Number of negative samples per positive sample
-            
-        Returns:
-            loss: BPR loss value
-        """
-        # Get positive examples (purchased packages)
-        pos_package_ids = batch['purchased']['package_ids']
-        
-        # Get embeddings for positive examples
-        pos_embeddings = self.package_embedding(pos_package_ids)
-        
-        # Calculate positive scores
-        user_vector = output['user_representation']
-        pos_scores = torch.sum(user_vector * pos_embeddings, dim=1, keepdim=True)
-        
-        # Generate negative samples
-        batch_size = user_vector.size(0)
-        neg_package_ids = torch.randint(
-            1, self.package_embedding.weight.size(0), 
-            (batch_size, negative_samples), 
-            device=user_vector.device
-        )
-        
-        # Get embeddings for negative examples
-        neg_embeddings = self.package_embedding(neg_package_ids)
-        
-        # Calculate negative scores
-        neg_scores = torch.bmm(
-            neg_embeddings,
-            user_vector.unsqueeze(2)
-        ).squeeze(2)
-        
-        # Calculate BPR loss
-        loss = -torch.mean(torch.log(torch.sigmoid(pos_scores - neg_scores)))
-        
-        return loss
-    
-    def recommend(self, user_representation, top_k=10):
-        """
-        Generate recommendations for a user
-        
-        Args:
-            user_representation: User representation vector
-            top_k: Number of recommendations to generate
-            
-        Returns:
-            top_k_indices: Indices of top-k recommended packages
-            top_k_scores: Scores of top-k recommended packages
-        """
-        # Calculate scores with all packages
-        all_packages = self.package_embedding.weight
-        scores = torch.matmul(user_representation, all_packages.t())
-        
-        # Get top-k recommendations
-        top_k_scores, top_k_indices = torch.topk(scores, k=top_k)
-        
-        return top_k_indices, top_k_scores
+        self.num_users = num_users
+        self.num_packages = num_packages
+        self.num_countries = num_countries
+        self.num_categories = num_categories
+        self.num_themes = num_themes
+        self.title_embedding_dim = title_embedding_dim
+        self.hidden_dim = hidden_dim
+        self.embedding_dim = embedding_dim
+        self.user_embedding_dim = user_embedding_dim
+        self.dropout = dropout
+        self.max_short_term = max_short_term
+        self.max_long_term = max_long_term
