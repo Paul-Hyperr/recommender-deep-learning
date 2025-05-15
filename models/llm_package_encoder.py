@@ -12,7 +12,7 @@ import pickle
 from tqdm import tqdm
 
 
-class LLMPackageEncoders(nn.Module):
+class LLMPackageEncoder(nn.Module):
     """
     Enhanced Package encoder using LLM embeddings with fallback title generation
     """

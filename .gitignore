@@ -177,4 +177,5 @@ cython_debug/
 
 /data/
 /output/
+/checkpoints/
 

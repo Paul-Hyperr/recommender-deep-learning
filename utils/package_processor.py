@@ -9,6 +9,8 @@ import time
 from tqdm import tqdm
 import sys
 import hashlib
+from functools import lru_cache
+from collections import defaultdict, Counter
 
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,7 +32,8 @@ class PackageProcessor:
                  load_coordinates=True, 
                  load_embeddings=True,
                  api_key=None,
-                 embedding_model='text-embedding-3-large'):
+                 embedding_model='text-embedding-3-large',
+                 use_reduced_embeddings=True):
         """
         Initialize PackageProcessor
         
@@ -48,6 +51,10 @@ class PackageProcessor:
         self.load_embeddings = load_embeddings
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.embedding_model = embedding_model
+        self.use_reduced_embeddings = use_reduced_embeddings
+        
+        # Set embedding dimension based on use_reduced_embeddings
+        self.embedding_dim = 768 if use_reduced_embeddings else 3072
         
         # Create cache directory if it doesn't exist
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -75,7 +82,8 @@ class PackageProcessor:
                     theme_vocab_size=100,
                     api_key=self.api_key,
                     embedding_model=self.embedding_model,
-                    cache_dir=os.path.join(self.cache_dir, 'llm_embeddings')
+                    cache_dir=os.path.join(self.cache_dir, 'llm_embeddings'),
+                    embedding_dim=self.embedding_dim
                 )
                 print(f"Initialized LLM encoder with {embedding_model}")
             except Exception as e:
@@ -655,13 +663,13 @@ class PackageProcessor:
 
 class TravelPackageDataset(Dataset):
     """
-    Enhanced Dataset for NATR travel package recommendation
+    Optimized Dataset for NATR travel package recommendation
     
-    Features:
-    - Handles package features: title embeddings, coordinates, categories (no cities!), prices
-    - Incorporates event types from user sessions
-    - Supports both purchase and non-purchase samples
-    - Caches prepared samples for faster loading
+    Key optimizations:
+    - Lazy loading of embeddings/coordinates
+    - Batch preprocessing with caching
+    - Memory-efficient tensor operations
+    - Reduced redundant computations
     """
     def __init__(self, 
                 samples: List[Dict[str, Any]], 
@@ -673,22 +681,10 @@ class TravelPackageDataset(Dataset):
                 max_long_term: int = 20,
                 empty_token: int = -1,  
                 unknown_token: int = -1,
-                use_cache: bool = True):
-        """
-        Initialize the dataset for NATR model with caching support
+                use_cache: bool = True,
+                prefetch_features: bool = True):
+        """Initialize with optimizations"""
         
-        Args:
-            samples: List of training/testing samples
-            package_processor: PackageProcessor instance with features
-            user_to_idx: Mapping from user ID to index
-            package_to_idx: Mapping from package ID to index
-            event_to_idx: Mapping from event type to index
-            max_short_term: Maximum length of short-term sequence
-            max_long_term: Maximum length of long-term sequence
-            empty_token: Special token for empty values
-            unknown_token: Token for unknown category values
-            use_cache: Whether to use cached prepared samples
-        """
         self.samples = samples
         self.package_processor = package_processor
         self.user_to_idx = user_to_idx
@@ -699,515 +695,345 @@ class TravelPackageDataset(Dataset):
         self.empty_token = empty_token
         self.unknown_token = unknown_token
         self.use_cache = use_cache
-
-        # Get package mappings from processor (excluding city_to_idx)
+        self.prefetch_features = prefetch_features
+        
+        # Get mappings
         mappings = self.package_processor.get_idx_mappings()
         self.country_to_idx = mappings['country_to_idx']
         self.category_to_idx = mappings['category_to_idx']
         self.theme_to_idx = mappings['theme_to_idx']
-        # NOTE: We don't use city_to_idx since we have coordinates
         
-        # Load all package features as tensors for efficiency
+        # Load package features tensors
         self.package_features = self.package_processor.prepare_package_tensors()
         
-        # Store embedding dimension
-        if 'title_embeddings' in self.package_features:
-            self.embedding_dim = self.package_features['title_embeddings'].shape[1]
-        else:
-            self.embedding_dim = 3072  # Default for text-embedding-3-large
+        # Store dimensions
+        self.embedding_dim = self.package_features['title_embeddings'].shape[1]
         
-        # Store original sample information
-        self.original_user_ids = []
-        self.has_short_term = []
-        self.is_purchase = []
-        self.session_ids = []
+        # Optimization: Create reverse mapping once
+        self.idx_to_main_id = {v: k for k, v in self.package_to_idx.items()}
         
-        # Pre-process samples (with caching)
-        if self.use_cache:
-            self._prepare_samples_with_cache()
-        else:
-            self._prepare_samples()
+        # Optimization: Prepare samples with batch processing
+        self._prepare_samples_optimized()
+        
+        # Optimization: Prefetch commonly used features
+        if prefetch_features:
+            self._prefetch_common_features()
     
     def __len__(self):
-        """Return the size of the dataset"""
-        return len(self.user_ids)
+        """Return the number of samples in the dataset"""
+        return len(self.samples)
+    
+    def _generate_cache_key(self):
+        """Generate a unique cache key based on dataset parameters"""
+        # Create a string with all parameters that affect the dataset
+        key_str = (
+            f"samples_{len(self.samples)}_"
+            f"max_short_{self.max_short_term}_"
+            f"max_long_{self.max_long_term}"
+        )
+        
+        # Hash it for a shorter filename
+        return hashlib.md5(key_str.encode()).hexdigest()[:10]
+    
+    def _prepare_samples_optimized(self):
+        """Optimized sample preparation with batch processing"""
+        
+        # Check cache first
+        cache_key = self._generate_cache_key()
+        cache_file = os.path.join(self.package_processor.cache_dir, f'dataset_{cache_key}.pkl')
+        
+        if self.use_cache and os.path.exists(cache_file):
+            print("Loading cached dataset...")
+            with open(cache_file, 'rb') as f:
+                cache_data = pickle.load(f)
+                for key, value in cache_data.items():
+                    setattr(self, key, value)
+                print(f"Loaded {len(self.user_ids)} samples from cache")
+                return
+        
+        print("Preparing samples (optimized)...")
+        
+        # Process in batches for memory efficiency
+        batch_size = 10000
+        all_tensors = defaultdict(list)
+        
+        for i in range(0, len(self.samples), batch_size):
+            batch_samples = self.samples[i:i+batch_size]
+            batch_tensors = self._process_batch(batch_samples)
+            
+            for key, tensor in batch_tensors.items():
+                all_tensors[key].append(tensor)
+            
+            # Clear memory periodically
+            if i % 50000 == 0:
+                torch.cuda.empty_cache()
+        
+        # Concatenate all batches
+        for key, tensor_list in all_tensors.items():
+            setattr(self, key, torch.cat(tensor_list, dim=0))
+        
+        # Save cache
+        if self.use_cache:
+            cache_data = {key: getattr(self, key) for key in all_tensors.keys()}
+            with open(cache_file, 'wb') as f:
+                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"Saved dataset cache: {cache_file}")
+    
+    def _process_batch(self, batch_samples):
+        """Process a batch of samples efficiently"""
+        
+        batch_size = len(batch_samples)
+        
+        # Pre-allocate arrays
+        user_ids = np.zeros(batch_size, dtype=np.int64)
+        has_short_term = np.zeros(batch_size, dtype=bool)
+        is_purchase = np.zeros(batch_size, dtype=bool)
+        
+        # Short-term arrays
+        st_packages = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
+        st_events = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
+        st_countries = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
+        st_categories = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
+        st_themes = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
+        st_prices = np.zeros((batch_size, self.max_short_term), dtype=np.float32)
+        
+        # Long-term arrays (similar)
+        lt_packages = np.zeros((batch_size, self.max_long_term), dtype=np.int64)
+        lt_events = np.zeros((batch_size, self.max_long_term), dtype=np.int64)
+        lt_countries = np.zeros((batch_size, self.max_long_term), dtype=np.int64)
+        lt_categories = np.zeros((batch_size, self.max_long_term), dtype=np.int64)
+        lt_themes = np.zeros((batch_size, self.max_long_term), dtype=np.int64)
+        lt_prices = np.zeros((batch_size, self.max_long_term), dtype=np.float32)
+        
+        # Purchased arrays
+        purchased_packages = np.zeros(batch_size, dtype=np.int64)
+        purchased_countries = np.zeros(batch_size, dtype=np.int64)
+        purchased_categories = np.zeros(batch_size, dtype=np.int64)
+        purchased_themes = np.zeros(batch_size, dtype=np.int64)
+        purchased_prices = np.zeros(batch_size, dtype=np.float32)
+        
+        # Process samples
+        for i, sample in enumerate(batch_samples):
+            # User info
+            user_ids[i] = self.user_to_idx.get(sample['user_id'], 0)
+            has_short_term[i] = len(sample.get('short_term_packages', [])) > 0
+            is_purchase[i] = sample.get('is_purchase', False)
+            
+            # Process short-term
+            if has_short_term[i]:
+                st_pkg_ids = sample['short_term_packages'][-self.max_short_term:]
+                st_event_ids = sample.get('short_term_events', [])[-self.max_short_term:]
+                
+                for j, (pkg_id, event_id) in enumerate(zip(st_pkg_ids, st_event_ids)):
+                    pkg_idx = self.package_to_idx.get(str(pkg_id), 0)
+                    st_packages[i, j] = pkg_idx
+                    st_events[i, j] = event_id
+                    
+                    # Get features efficiently
+                    features = self._get_package_features_fast(str(pkg_id))
+                    st_countries[i, j] = features[0]
+                    st_categories[i, j] = features[1]
+                    st_themes[i, j] = features[2]
+                    st_prices[i, j] = features[3]
+            
+            # Process long-term (similar logic)
+            lt_pkg_ids = sample.get('long_term_packages', [])[-self.max_long_term:]
+            if lt_pkg_ids:
+                lt_event_ids = sample.get('long_term_events', [])[-self.max_long_term:]
+                
+                for j, (pkg_id, event_id) in enumerate(zip(lt_pkg_ids, lt_event_ids)):
+                    pkg_idx = self.package_to_idx.get(str(pkg_id), 0)
+                    lt_packages[i, j] = pkg_idx
+                    lt_events[i, j] = event_id
+                    
+                    features = self._get_package_features_fast(str(pkg_id))
+                    lt_countries[i, j] = features[0]
+                    lt_categories[i, j] = features[1]
+                    lt_themes[i, j] = features[2]
+                    lt_prices[i, j] = features[3]
+            
+            # Process purchased
+            purchased_id = str(sample['purchased_package'])
+            purchased_packages[i] = self.package_to_idx.get(purchased_id, 0)
+            
+            features = self._get_package_features_fast(purchased_id)
+            purchased_countries[i] = features[0]
+            purchased_categories[i] = features[1]
+            purchased_themes[i] = features[2]
+            purchased_prices[i] = features[3]
+        
+        # Convert to tensors
+        return {
+            'user_ids': torch.from_numpy(user_ids),
+            'has_short_term': torch.from_numpy(has_short_term),
+            'is_purchase': torch.from_numpy(is_purchase),
+            'short_term_packages': torch.from_numpy(st_packages),
+            'short_term_events': torch.from_numpy(st_events),
+            'short_term_countries': torch.from_numpy(st_countries),
+            'short_term_categories': torch.from_numpy(st_categories),
+            'short_term_themes': torch.from_numpy(st_themes),
+            'short_term_prices': torch.from_numpy(st_prices),
+            'long_term_packages': torch.from_numpy(lt_packages),
+            'long_term_events': torch.from_numpy(lt_events),
+            'long_term_countries': torch.from_numpy(lt_countries),
+            'long_term_categories': torch.from_numpy(lt_categories),
+            'long_term_themes': torch.from_numpy(lt_themes),
+            'long_term_prices': torch.from_numpy(lt_prices),
+            'purchased_packages': torch.from_numpy(purchased_packages),
+            'purchased_countries': torch.from_numpy(purchased_countries),
+            'purchased_categories': torch.from_numpy(purchased_categories),
+            'purchased_themes': torch.from_numpy(purchased_themes),
+            'purchased_prices': torch.from_numpy(purchased_prices)
+        }
+    
+    @lru_cache(maxsize=50000)
+    def _get_package_features_fast(self, pkg_id: str) -> tuple:
+        """Fast cached package feature lookup"""
+        features = self.package_processor.get_package_features(pkg_id)
+        if features:
+            return (
+                features['country_idx'],
+                features['category_idx'],
+                features['theme_idx'],
+                features['price']
+            )
+        return (0, 0, 0, 0.0)
+    
+    def _prefetch_common_features(self):
+        """Prefetch features for frequently accessed packages"""
+        print("Prefetching common package features...")
+        
+        # Get most common packages
+        package_counts = Counter()
+        for i in range(len(self.short_term_packages)):
+            for pkg_idx in self.short_term_packages[i]:
+                if pkg_idx > 0:
+                    package_counts[pkg_idx.item()] += 1
+        
+        # Prefetch top packages
+        top_packages = package_counts.most_common(1000)
+        for pkg_idx, _ in top_packages:
+            main_id = self.idx_to_main_id.get(pkg_idx)
+            if main_id:
+                self._get_package_features_fast(str(main_id))
     
     def __getitem__(self, idx):
-        """Get a sample from the dataset"""
+        """Optimized getitem with minimal computation"""
+        # Use pre-computed indices
+        user_id = self.user_ids[idx]
+        
+        # Build sample efficiently
         sample = {
-            'user_id': self.user_ids[idx],
-            'original_user_id': self.original_user_ids[idx],
+            'user_id': user_id,
             'has_short_term': self.has_short_term[idx],
+            'is_purchase': self.is_purchase[idx],
             
-            # Short-term features (NO CITIES)
             'short_term': {
                 'package_ids': self.short_term_packages[idx],
                 'event_types': self.short_term_events[idx],
-                'title_embeddings': self.get_sequence_embeddings(self.short_term_packages[idx], 'short'),
-                'coordinates': self.get_sequence_coordinates(self.short_term_packages[idx], 'short'),
+                'title_embeddings': self._get_embeddings_fast(self.short_term_packages[idx], 'short'),
+                'coordinates': self._get_coordinates_fast(self.short_term_packages[idx], 'short'),
                 'country_ids': self.short_term_countries[idx],
                 'category_ids': self.short_term_categories[idx],
                 'theme_ids': self.short_term_themes[idx],
                 'prices': self.short_term_prices[idx]
             },
             
-            # Long-term features (NO CITIES)
             'long_term': {
                 'package_ids': self.long_term_packages[idx],
                 'event_types': self.long_term_events[idx],
-                'title_embeddings': self.get_sequence_embeddings(self.long_term_packages[idx], 'long'),
-                'coordinates': self.get_sequence_coordinates(self.long_term_packages[idx], 'long'),
+                'title_embeddings': self._get_embeddings_fast(self.long_term_packages[idx], 'long'),
+                'coordinates': self._get_coordinates_fast(self.long_term_packages[idx], 'long'),
                 'country_ids': self.long_term_countries[idx],
                 'category_ids': self.long_term_categories[idx],
                 'theme_ids': self.long_term_themes[idx],
                 'prices': self.long_term_prices[idx]
             },
             
-            # Purchased/target package features (NO CITIES)
             'purchased': {
-                'package_id': self.purchased_packages[idx],
-                'title_embedding': self.get_package_embedding(self.purchased_packages[idx]),
-                'coordinates': self.get_package_coordinates(self.purchased_packages[idx]),
-                'country_id': self.purchased_countries[idx],
-                'category_id': self.purchased_categories[idx],
-                'theme_id': self.purchased_themes[idx],
-                'price': self.purchased_prices[idx]
+                'package_ids': self.purchased_packages[idx],
+                'title_embeddings': self._get_single_embedding_fast(self.purchased_packages[idx]),
+                'coordinates': self._get_single_coordinates_fast(self.purchased_packages[idx]),
+                'country_ids': self.purchased_countries[idx],
+                'category_ids': self.purchased_categories[idx],
+                'theme_ids': self.purchased_themes[idx],
+                'prices': self.purchased_prices[idx]
             }
         }
         
-        # Add optional fields
-        if isinstance(self.is_purchase, torch.Tensor):
-            sample['is_purchase'] = self.is_purchase[idx]
-        
-        if isinstance(self.session_ids, torch.Tensor):
-            sample['session_id'] = self.session_ids[idx]
-        
         return sample
-
-    # Fixed TravelPackageDataset caching method
-
-    def _prepare_samples_with_cache(self):
-        """Pre-process samples with caching for faster subsequent runs - FIXED VERSION"""
-        # Create a hash of the samples to ensure cache validity
-        sample_info = f"{len(self.samples)}_{self.max_short_term}_{self.max_long_term}"
-        sample_hash = hashlib.md5(sample_info.encode()).hexdigest()[:8]
-        cache_file = os.path.join(
-            self.package_processor.cache_dir, 
-            f'prepared_dataset_samples_{sample_hash}.pkl'
-        )
-        
-        # Try to load from cache
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'rb') as f:
-                    cached_data = pickle.load(f)
-                
-                print(f"Loading pre-processed samples from cache...")
-                for key, value in cached_data.items():
-                    setattr(self, key, value)
-                print(f"Loaded {len(self.user_ids)} cached samples")
-                return
-            except Exception as e:
-                print(f"Cache loading failed: {e}")
-        
-        # Process normally
-        self._prepare_samples()
-        
-        # Save to cache - FIXED to use pickle only, no JSON
-        cache_data = {
-            'user_ids': self.user_ids,
-            'original_user_ids': self.original_user_ids,
-            'has_short_term': self.has_short_term,
-            'is_purchase': self.is_purchase if hasattr(self, 'is_purchase') else [],
-            'session_ids': self.session_ids if hasattr(self, 'session_ids') else [],
-            'short_term_packages': self.short_term_packages,
-            'short_term_countries': self.short_term_countries,
-            'short_term_categories': self.short_term_categories,
-            'short_term_themes': self.short_term_themes,
-            'short_term_prices': self.short_term_prices,
-            'short_term_events': self.short_term_events,
-            'long_term_packages': self.long_term_packages,
-            'long_term_countries': self.long_term_countries,
-            'long_term_categories': self.long_term_categories,
-            'long_term_themes': self.long_term_themes,
-            'long_term_prices': self.long_term_prices,
-            'long_term_events': self.long_term_events,
-            'purchased_packages': self.purchased_packages,
-            'purchased_countries': self.purchased_countries,
-            'purchased_categories': self.purchased_categories,
-            'purchased_themes': self.purchased_themes,
-            'purchased_prices': self.purchased_prices,
-        }
-        
-        try:
-            # Just use pickle - no JSON metadata that could cause serialization issues
-            with open(cache_file, 'wb') as f:
-                pickle.dump(cache_data, f)
-            print(f"Saved prepared samples to cache: {cache_file}")
-        except Exception as e:
-            print(f"Failed to save cache: {e}")
-            # Continue anyway - caching is optional
     
-    def _prepare_samples(self):
-        """Pre-process samples for faster retrieval with all features"""
-        print("Pre-processing samples for NATR dataset...")
-        
-        # Initialize lists
-        self.user_ids = []
-        self.original_user_ids = []
-        self.has_short_term = []
-        self.is_purchase = []
-        self.session_ids = []
-        
-        # Short-term sequences (NO CITIES)
-        self.short_term_packages = []
-        self.short_term_countries = []
-        self.short_term_categories = []
-        self.short_term_themes = []
-        self.short_term_prices = []
-        self.short_term_events = []
-        
-        # Long-term sequences (NO CITIES)
-        self.long_term_packages = []
-        self.long_term_countries = []
-        self.long_term_categories = []
-        self.long_term_themes = []
-        self.long_term_prices = []
-        self.long_term_events = []
-        
-        # Purchased/target package (NO CITIES)
-        self.purchased_packages = []
-        self.purchased_countries = []
-        self.purchased_categories = []
-        self.purchased_themes = []
-        self.purchased_prices = []
-        
-        # Statistics
-        empty_short_term_count = 0
-        empty_long_term_count = 0
-        
-        # Process each sample
-        for sample in tqdm(self.samples, desc="Preparing NATR dataset"):
-            # User information
-            user_id = sample['user_id']
-            self.original_user_ids.append(user_id)
-            
-            # Optional fields
-            if 'is_purchase' in sample:
-                self.is_purchase.append(sample['is_purchase'])
-            
-            if 'session_id' in sample:
-                self.session_ids.append(sample['session_id'])
-            
-            # Map user ID
-            user_idx = self.user_to_idx.get(user_id, 1)
-            self.user_ids.append(user_idx)
-            
-            # Process short-term sequence
-            has_short_term = len(sample['short_term_packages']) > 0
-            self.has_short_term.append(has_short_term)
-            
-            if not has_short_term:
-                empty_short_term_count += 1
-                # Use empty token for first position
-                st_pkgs = [self.empty_token] + [0] * (self.max_short_term - 1)
-                st_countries = [self.unknown_token] + [0] * (self.max_short_term - 1)
-                st_categories = [self.unknown_token] + [0] * (self.max_short_term - 1)
-                st_themes = [self.unknown_token] + [0] * (self.max_short_term - 1)
-                st_prices = [0.0] * self.max_short_term
-                st_events = [self.empty_token] + [0] * (self.max_short_term - 1)
-            else:
-                # Truncate if necessary
-                short_term_pkgs = sample['short_term_packages'][-self.max_short_term:]
-                short_term_events = sample.get('short_term_events', [])[-self.max_short_term:]
-                short_term_len = len(short_term_pkgs)
-                
-                # Process each package
-                st_pkgs = []
-                st_countries = []
-                st_categories = []
-                st_themes = []
-                st_prices = []
-                st_events = []
-                
-                for i, pkg_id in enumerate(short_term_pkgs):
-                    pkg_str = str(pkg_id)
-                    pkg_idx = self.package_to_idx.get(pkg_str, 1)
-                    st_pkgs.append(pkg_idx)
-                    
-                    # Get package features (NO CITIES)
-                    features = self.package_processor.get_package_features(pkg_str)
-                    
-                    if features:
-                        st_countries.append(features['country_idx'])
-                        st_categories.append(features['category_idx'])
-                        st_themes.append(features['theme_idx'])
-                        st_prices.append(features['price'])
-                    else:
-                        st_countries.append(self.unknown_token)
-                        st_categories.append(self.unknown_token)
-                        st_themes.append(self.unknown_token)
-                        st_prices.append(0.0)
-                    
-                    # Event type
-                    event_idx = short_term_events[i] if i < len(short_term_events) else 0
-                    st_events.append(event_idx)
-                
-                # Pad sequences
-                st_pkgs += [0] * (self.max_short_term - short_term_len)
-                st_countries += [0] * (self.max_short_term - short_term_len)
-                st_categories += [0] * (self.max_short_term - short_term_len)
-                st_themes += [0] * (self.max_short_term - short_term_len)
-                st_prices += [0.0] * (self.max_short_term - short_term_len)
-                st_events += [0] * (self.max_short_term - short_term_len)
-            
-            # Store short-term data
-            self.short_term_packages.append(st_pkgs)
-            self.short_term_countries.append(st_countries)
-            self.short_term_categories.append(st_categories)
-            self.short_term_themes.append(st_themes)
-            self.short_term_prices.append(st_prices)
-            self.short_term_events.append(st_events)
-            
-            # Process long-term sequence (similar logic, NO CITIES)
-            has_long_term = 'long_term_packages' in sample and len(sample['long_term_packages']) > 0
-            
-            if not has_long_term:
-                empty_long_term_count += 1
-                lt_pkgs = [self.empty_token] + [0] * (self.max_long_term - 1)
-                lt_countries = [self.unknown_token] + [0] * (self.max_long_term - 1)
-                lt_categories = [self.unknown_token] + [0] * (self.max_long_term - 1)
-                lt_themes = [self.unknown_token] + [0] * (self.max_long_term - 1)
-                lt_prices = [0.0] * self.max_long_term
-                lt_events = [self.empty_token] + [0] * (self.max_long_term - 1)
-            else:
-                long_term_pkgs = sample['long_term_packages'][-self.max_long_term:]
-                long_term_events = sample.get('long_term_events', [])[-self.max_long_term:]
-                long_term_len = len(long_term_pkgs)
-                
-                lt_pkgs = []
-                lt_countries = []
-                lt_categories = []
-                lt_themes = []
-                lt_prices = []
-                lt_events = []
-                
-                for i, pkg_id in enumerate(long_term_pkgs):
-                    pkg_str = str(pkg_id)
-                    pkg_idx = self.package_to_idx.get(pkg_str, 1)
-                    lt_pkgs.append(pkg_idx)
-                    
-                    features = self.package_processor.get_package_features(pkg_str)
-                    
-                    if features:
-                        lt_countries.append(features['country_idx'])
-                        lt_categories.append(features['category_idx'])
-                        lt_themes.append(features['theme_idx'])
-                        lt_prices.append(features['price'])
-                    else:
-                        lt_countries.append(self.unknown_token)
-                        lt_categories.append(self.unknown_token)
-                        lt_themes.append(self.unknown_token)
-                        lt_prices.append(0.0)
-                    
-                    event_idx = long_term_events[i] if i < len(long_term_events) else 0
-                    lt_events.append(event_idx)
-                
-                # Pad sequences
-                lt_pkgs += [0] * (self.max_long_term - long_term_len)
-                lt_countries += [0] * (self.max_long_term - long_term_len)
-                lt_categories += [0] * (self.max_long_term - long_term_len)
-                lt_themes += [0] * (self.max_long_term - long_term_len)
-                lt_prices += [0.0] * (self.max_long_term - long_term_len)
-                lt_events += [0] * (self.max_long_term - long_term_len)
-            
-            # Store long-term data
-            self.long_term_packages.append(lt_pkgs)
-            self.long_term_countries.append(lt_countries)
-            self.long_term_categories.append(lt_categories)
-            self.long_term_themes.append(lt_themes)
-            self.long_term_prices.append(lt_prices)
-            self.long_term_events.append(lt_events)
-            
-            # Process purchased/target package (NO CITIES)
-            purchased_pkg_id = str(sample['purchased_package'])
-            purchased_pkg_idx = self.package_to_idx.get(purchased_pkg_id, 1)
-            
-            features = self.package_processor.get_package_features(purchased_pkg_id)
-            
-            if features:
-                self.purchased_packages.append(purchased_pkg_idx)
-                self.purchased_countries.append(features['country_idx'])
-                self.purchased_categories.append(features['category_idx'])
-                self.purchased_themes.append(features['theme_idx'])
-                self.purchased_prices.append(features['price'])
-            else:
-                self.purchased_packages.append(purchased_pkg_idx)
-                self.purchased_countries.append(self.unknown_token)
-                self.purchased_categories.append(self.unknown_token)
-                self.purchased_themes.append(self.unknown_token)
-                self.purchased_prices.append(0.0)
-        
-        # Convert to tensors
-        self.user_ids = torch.tensor(self.user_ids, dtype=torch.long)
-        self.has_short_term = torch.tensor(self.has_short_term, dtype=torch.bool)
-        
-        if self.is_purchase:
-            self.is_purchase = torch.tensor(self.is_purchase, dtype=torch.bool)
-        
-        if self.session_ids:
-            self.session_ids = torch.tensor(self.session_ids, dtype=torch.long)
-        
-        # Convert package data to tensors (NO CITIES)
-        self.short_term_packages = torch.tensor(self.short_term_packages, dtype=torch.long)
-        self.short_term_countries = torch.tensor(self.short_term_countries, dtype=torch.long)
-        self.short_term_categories = torch.tensor(self.short_term_categories, dtype=torch.long)
-        self.short_term_themes = torch.tensor(self.short_term_themes, dtype=torch.long)
-        self.short_term_prices = torch.tensor(self.short_term_prices, dtype=torch.float)
-        self.short_term_events = torch.tensor(self.short_term_events, dtype=torch.long)
-        
-        self.long_term_packages = torch.tensor(self.long_term_packages, dtype=torch.long)
-        self.long_term_countries = torch.tensor(self.long_term_countries, dtype=torch.long)
-        self.long_term_categories = torch.tensor(self.long_term_categories, dtype=torch.long)
-        self.long_term_themes = torch.tensor(self.long_term_themes, dtype=torch.long)
-        self.long_term_prices = torch.tensor(self.long_term_prices, dtype=torch.float)
-        self.long_term_events = torch.tensor(self.long_term_events, dtype=torch.long)
-        
-        self.purchased_packages = torch.tensor(self.purchased_packages, dtype=torch.long)
-        self.purchased_countries = torch.tensor(self.purchased_countries, dtype=torch.long)
-        self.purchased_categories = torch.tensor(self.purchased_categories, dtype=torch.long)
-        self.purchased_themes = torch.tensor(self.purchased_themes, dtype=torch.long)
-        self.purchased_prices = torch.tensor(self.purchased_prices, dtype=torch.float)
-        
-        # Print statistics
-        print(f"NATR dataset prepared with {len(self.user_ids)} samples")
-        print(f"Empty short-term: {empty_short_term_count} ({empty_short_term_count/len(self.user_ids)*100:.2f}%)")
-        print(f"Empty long-term: {empty_long_term_count} ({empty_long_term_count/len(self.user_ids)*100:.2f}%)")
-        
-        # Print event type distribution
-        if len(self.short_term_events) > 0:
-            print("\nEvent type distribution in sequences:")
-            for event_name, event_idx in self.event_to_idx.items():
-                st_count = (self.short_term_events == event_idx).sum().item()
-                lt_count = (self.long_term_events == event_idx).sum().item()
-                print(f"  {event_name}: ST={st_count}, LT={lt_count}")
-        
-        # Print purchase statistics
-        if hasattr(self, 'is_purchase') and len(self.is_purchase) > 0:
-            purchase_count = self.is_purchase.sum().item() if torch.is_tensor(self.is_purchase) else sum(self.is_purchase)
-            non_purchase_count = len(self.is_purchase) - purchase_count
-            print(f"\nPurchase samples: {purchase_count} ({purchase_count/len(self.user_ids)*100:.2f}%)")
-            print(f"Non-purchase samples: {non_purchase_count} ({non_purchase_count/len(self.user_ids)*100:.2f}%)")
-
-    # Keep all the existing methods for embeddings and coordinates
-    def get_sequence_embeddings(self, package_ids, sequence_type):
-        """Get title embeddings for a sequence of packages"""
-        max_len = self.max_short_term if sequence_type == 'short' else self.max_long_term
+    def _get_embeddings_fast(self, package_ids, seq_type):
+        """Vectorized embedding retrieval"""
+        max_len = self.max_short_term if seq_type == 'short' else self.max_long_term
         embeddings = torch.zeros(max_len, self.embedding_dim)
         
-        # Get reverse mapping from package_to_idx
-        idx_to_main_id = {v: k for k, v in self.package_to_idx.items()}
-        
-        # Get feature package to idx mapping
-        feature_package_to_idx = self.package_features.get('package_to_idx', {})
+        # Get feature indices for all packages at once
+        feature_indices = []
+        valid_positions = []
         
         for i, pkg_idx in enumerate(package_ids):
-            if pkg_idx <= 0 or pkg_idx == self.empty_token:
-                continue
-            
-            # Find the main_id for this package index
-            main_id = idx_to_main_id.get(pkg_idx.item() if torch.is_tensor(pkg_idx) else pkg_idx)
-            if main_id is None:
-                continue
-            
-            # Convert to string (consistent with how it's stored)
-            main_id_str = str(main_id)
-            
-            # Check in package features
-            feature_idx = feature_package_to_idx.get(main_id_str)
-            
-            if feature_idx is not None and feature_idx < len(self.package_features['title_embeddings']):
-                embeddings[i] = self.package_features['title_embeddings'][feature_idx]
+            if pkg_idx > 0:
+                main_id = self.idx_to_main_id.get(pkg_idx.item())
+                if main_id:
+                    feature_idx = self.package_features['package_to_idx'].get(str(main_id))
+                    if feature_idx is not None:
+                        feature_indices.append(feature_idx)
+                        valid_positions.append(i)
+        
+        # Vectorized assignment
+        if feature_indices:
+            embeddings[valid_positions] = self.package_features['title_embeddings'][feature_indices]
         
         return embeddings
     
-    def get_sequence_coordinates(self, package_ids, sequence_type):
-        """Get coordinates for a sequence of packages"""
-        max_len = self.max_short_term if sequence_type == 'short' else self.max_long_term
+    def _get_coordinates_fast(self, package_ids, seq_type):
+        """Vectorized coordinate retrieval"""
+        max_len = self.max_short_term if seq_type == 'short' else self.max_long_term
         coordinates = torch.zeros(max_len, 2)
         
-        # Get reverse mapping from package_to_idx
-        idx_to_main_id = {v: k for k, v in self.package_to_idx.items()}
-        
-        # Get feature package to idx mapping
-        feature_package_to_idx = self.package_features.get('package_to_idx', {})
+        # Similar vectorized logic as embeddings
+        feature_indices = []
+        valid_positions = []
         
         for i, pkg_idx in enumerate(package_ids):
-            if pkg_idx <= 0 or pkg_idx == self.empty_token:
-                continue
-            
-            # Find the main_id for this package index
-            main_id = idx_to_main_id.get(pkg_idx.item() if torch.is_tensor(pkg_idx) else pkg_idx)
-            if main_id is None:
-                continue
-            
-            # Convert to string (consistent with how it's stored)
-            main_id_str = str(main_id)
-            
-            # Check in package features
-            feature_idx = feature_package_to_idx.get(main_id_str)
-            
-            if feature_idx is not None and feature_idx < len(self.package_features['coordinates']):
-                coordinates[i] = self.package_features['coordinates'][feature_idx]
+            if pkg_idx > 0:
+                main_id = self.idx_to_main_id.get(pkg_idx.item())
+                if main_id:
+                    feature_idx = self.package_features['package_to_idx'].get(str(main_id))
+                    if feature_idx is not None:
+                        feature_indices.append(feature_idx)
+                        valid_positions.append(i)
+        
+        if feature_indices:
+            coordinates[valid_positions] = self.package_features['coordinates'][feature_indices]
         
         return coordinates
     
-    def get_package_embedding(self, package_id):
-        """Get embedding for a single package"""
-        # Handle tensor input
-        if torch.is_tensor(package_id):
-            package_id = package_id.item()
-        
-        # Get reverse mapping
-        idx_to_main_id = {v: k for k, v in self.package_to_idx.items()}
-        
-        # Find the main_id
-        main_id = idx_to_main_id.get(package_id)
-        if main_id is None:
+    @lru_cache(maxsize=10000)
+    def _get_single_embedding_fast(self, pkg_idx):
+        """Cached single embedding retrieval"""
+        if pkg_idx <= 0:
             return torch.zeros(self.embedding_dim)
         
-        # Convert to string
-        main_id_str = str(main_id)
+        main_id = self.idx_to_main_id.get(pkg_idx.item() if torch.is_tensor(pkg_idx) else pkg_idx)
+        if main_id:
+            feature_idx = self.package_features['package_to_idx'].get(str(main_id))
+            if feature_idx is not None:
+                return self.package_features['title_embeddings'][feature_idx]
         
-        # Get feature index
-        feature_idx = self.package_features.get('package_to_idx', {}).get(main_id_str)
-        
-        if feature_idx is not None and feature_idx < len(self.package_features['title_embeddings']):
-            return self.package_features['title_embeddings'][feature_idx]
-        else:
-            return torch.zeros(self.embedding_dim)
-
-    def get_package_coordinates(self, package_id):
-        """Get coordinates for a single package"""
-        # Handle tensor input
-        if torch.is_tensor(package_id):
-            package_id = package_id.item()
-        
-        # Get reverse mapping
-        idx_to_main_id = {v: k for k, v in self.package_to_idx.items()}
-        
-        # Find the main_id
-        main_id = idx_to_main_id.get(package_id)
-        if main_id is None:
+        return torch.zeros(self.embedding_dim)
+    
+    @lru_cache(maxsize=10000)
+    def _get_single_coordinates_fast(self, pkg_idx):
+        """Cached single coordinate retrieval"""
+        if pkg_idx <= 0:
             return torch.zeros(2)
         
-        # Convert to string
-        main_id_str = str(main_id)
+        main_id = self.idx_to_main_id.get(pkg_idx.item() if torch.is_tensor(pkg_idx) else pkg_idx)
+        if main_id:
+            feature_idx = self.package_features['package_to_idx'].get(str(main_id))
+            if feature_idx is not None:
+                return self.package_features['coordinates'][feature_idx]
         
-        # Get feature index
-        feature_idx = self.package_features.get('package_to_idx', {}).get(main_id_str)
-        
-        if feature_idx is not None and feature_idx < len(self.package_features['coordinates']):
-            return self.package_features['coordinates'][feature_idx]
-        else:
-            return torch.zeros(2)
+        return torch.zeros(2)

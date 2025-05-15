@@ -20,7 +20,7 @@ def prepare_natr_dataloaders(
     batch_size: int = 32,
     test_size: float = 0.2,
     random_seed: int = 42,
-    num_workers: int = 4,
+    num_workers: int = 0,
     max_short_term: int = 10,
     max_long_term: int = 20,
     balance_purchases: bool = True
@@ -117,8 +117,8 @@ def prepare_natr_dataloaders(
         event_to_idx,
         max_short_term=max_short_term,
         max_long_term=max_long_term,
-        empty_token=-1,
-        unknown_token=-1
+        empty_token=-0,
+        unknown_token=0
     )
     
     test_dataset = TravelPackageDataset(
@@ -129,8 +129,8 @@ def prepare_natr_dataloaders(
         event_to_idx,
         max_short_term=max_short_term,
         max_long_term=max_long_term,
-        empty_token=-1,
-        unknown_token=-1
+        empty_token=0,
+        unknown_token=0
     )
     
     # Create dataloaders
@@ -164,7 +164,8 @@ def prepare_data_for_natr(
     min_interactions: int = 5,
     max_short_term: int = 10,
     max_long_term: int = 20,
-    balance_purchases: bool = True
+    balance_purchases: bool = True,
+    num_workers: int = 0
 ) -> Tuple[DataLoader, DataLoader, PackageProcessor, SessionProcessor]:
     """
     Complete data preparation pipeline for NATR model
@@ -229,7 +230,8 @@ def prepare_data_for_natr(
         test_size=test_size,
         max_short_term=max_short_term,
         max_long_term=max_long_term,
-        balance_purchases=balance_purchases
+        balance_purchases=balance_purchases,
+        num_workers=num_workers
     )
     
     print("\n=== NATR Data Preparation Complete ===")
@@ -244,7 +246,7 @@ def prepare_data_for_natr(
     print(f"  Short-term embeddings: {sample_batch['short_term']['title_embeddings'].shape}")
     print(f"  Short-term coordinates: {sample_batch['short_term']['coordinates'].shape}")
     print(f"  Long-term packages: {sample_batch['long_term']['package_ids'].shape}")
-    print(f"  Purchased package: {sample_batch['purchased']['package_id'].shape}")
+    print(f"  Purchased package: {sample_batch['purchased']['package_ids'].shape}")
     
     return train_loader, test_loader, package_processor, session_processor
 
