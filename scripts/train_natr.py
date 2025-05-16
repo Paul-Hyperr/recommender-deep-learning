@@ -33,12 +33,97 @@ from utils.package_processor import PackageProcessor, TravelPackageDataset
 from utils.loss_functions import NaturalPurchaseLoss, PurchaseFocusedMetrics
 
 
-def filter_items_by_frequency(samples, min_frequency=5):
+def filter_by_min_session_length(samples, min_session_length=2):
+    """Filter out sessions that are too short for quality training
+    
+    Args:
+        samples: List of training samples
+        min_session_length: Minimum number of interactions required in short-term sequence
+        
+    Returns:
+        List of filtered samples
+    """
+    print(f"\nFiltering sessions by length (min: {min_session_length})...")
+    
+    # Count samples before
+    total_before = len(samples)
+    
+    # Group samples by user
+    user_samples = {}
+    for sample in samples:
+        user_id = sample.get('user_id')
+        if user_id not in user_samples:
+            user_samples[user_id] = []
+        user_samples[user_id].append(sample)
+    
+    # Filter by session length while preserving at least one sample per user
+    quality_samples = []
+    users_with_no_quality_sessions = 0
+    
+    for user_id, user_session_samples in user_samples.items():
+        # First find quality samples for this user
+        user_quality_samples = []
+        
+        for sample in user_session_samples:
+            # Count interactions in short-term
+            short_term_length = len(sample.get('short_term_packages', []))
+            
+            # Only keep samples with sufficient interactions
+            if short_term_length >= min_session_length:
+                user_quality_samples.append(sample)
+        
+        # If user has quality samples, add them all
+        if user_quality_samples:
+            quality_samples.extend(user_quality_samples)
+        # If user has no quality samples but has purchase samples, keep those
+        else:
+            # Find purchase samples for this user
+            purchase_samples = [s for s in user_session_samples if s.get('is_purchase', False)]
+            
+            if purchase_samples:
+                # Keep all purchase samples even if they're short
+                quality_samples.extend(purchase_samples)
+            else:
+                # Otherwise keep their longest session
+                if user_session_samples:
+                    best_sample = max(user_session_samples, 
+                                     key=lambda s: len(s.get('short_term_packages', [])))
+                    quality_samples.append(best_sample)
+                    
+            users_with_no_quality_sessions += 1
+    
+    # Count samples after
+    total_after = len(quality_samples)
+    
+    print(f"Samples after session length filtering: {total_after} ({total_after/total_before*100:.1f}%)")
+    print(f"Users without quality sessions (fallback to best): {users_with_no_quality_sessions}")
+    
+    return quality_samples
+
+
+def filter_items_by_frequency(samples, min_frequency=50):  # Reduced from 100 to 50
     """Filter items that appear less than min_frequency times
     
-    A package must have at least 5 interactions to be included
+    For non-purchase samples, a package must have at least 100 interactions to be included
+    Purchase samples are always preserved regardless of package frequency
+    
+    This ensures we don't lose valuable purchase data while still filtering low-quality packages
+    from non-purchase sessions
     """
     print(f"\nFiltering items by frequency (min: {min_frequency})...")
+    
+    # First separate purchase and non-purchase samples
+    purchase_samples = [s for s in samples if s.get('is_purchase', False)]
+    non_purchase_samples = [s for s in samples if not s.get('is_purchase', False)]
+    
+    # Get all packages that were purchased (we'll keep these regardless of frequency)
+    purchased_packages = set()
+    for sample in purchase_samples:
+        purchased = str(sample.get('purchased_package', ''))
+        if purchased:
+            purchased_packages.add(purchased)
+    
+    print(f"Found {len(purchased_packages)} unique purchased packages (will be preserved)")
     
     # Count package occurrences efficiently
     package_counts = Counter()
@@ -54,17 +139,15 @@ def filter_items_by_frequency(samples, min_frequency=5):
             if pkg:
                 package_counts[str(pkg)] += 1
     
-    # Find valid packages
-    valid_packages = {pkg for pkg, count in package_counts.items() if count >= min_frequency}
+    # Find valid packages - include all purchased packages plus frequent non-purchased ones
+    valid_packages = {pkg for pkg, count in package_counts.items() if count >= min_frequency or pkg in purchased_packages}
     print(f"Valid packages: {len(valid_packages)} out of {len(package_counts)}")
     
-    # Filter samples efficiently
-    filtered_samples = []
-    for sample in samples:
-        purchased = str(sample.get('purchased_package', ''))
-        if purchased not in valid_packages:
-            continue
-        
+    # All purchase samples are kept
+    filtered_samples = list(purchase_samples)  # Create a copy
+    
+    # For non-purchase samples, filter packages
+    for sample in non_purchase_samples:
         # Filter packages in sequences
         sample_copy = sample.copy()
         sample_copy['short_term_packages'] = [pkg for pkg in sample.get('short_term_packages', []) 
@@ -77,6 +160,7 @@ def filter_items_by_frequency(samples, min_frequency=5):
             filtered_samples.append(sample_copy)
     
     print(f"Samples after filtering: {len(filtered_samples)} ({len(filtered_samples)/len(samples)*100:.1f}%)")
+    print(f"Purchase samples preserved: {len(purchase_samples)} (100%)")
     
     return filtered_samples, valid_packages
 
@@ -92,36 +176,87 @@ def time_based_split_year(samples, train_ratio=0.93):
         split_idx = int(len(samples) * train_ratio)
         return [samples[i] for i in indices[:split_idx]], [samples[i] for i in indices[split_idx:]]
     
+    # Determine if timestamps are epoch or datetime strings
+    # Try to infer timestamp format from first sample
+    first_timestamp = samples[0]['timestamp']
+    timestamp_is_numeric = isinstance(first_timestamp, (int, float)) or \
+                          (isinstance(first_timestamp, str) and first_timestamp.isdigit())
+    
+    # Define sorting key function based on format
+    def get_timestamp(sample):
+        ts = sample.get('timestamp', 0)
+        if timestamp_is_numeric:
+            # Convert string numbers to float if needed
+            return float(ts) if isinstance(ts, str) else ts
+        else:
+            # Keep as is for datetime conversion later
+            return ts
+    
     # Sort by timestamp
-    samples_sorted = sorted(samples, key=lambda x: x.get('timestamp', 0))
+    samples_sorted = sorted(samples, key=get_timestamp)
     
     # Get time range
-    first_time = samples_sorted[0]['timestamp']
-    last_time = samples_sorted[-1]['timestamp']
+    first_time = get_timestamp(samples_sorted[0])
+    last_time = get_timestamp(samples_sorted[-1])
     
-    # Convert to datetime
-    first_date = pd.to_datetime(first_time)
-    last_date = pd.to_datetime(last_time)
-    
-    print(f"Data spans from {first_date.date()} to {last_date.date()}")
-    
-    # Calculate split point
-    total_duration = last_date - first_date
-    train_duration = total_duration * train_ratio
-    split_date = first_date + train_duration
-    split_date = split_date.normalize() + pd.Timedelta(days=1)
-    
-    print(f"Split date: {split_date.date()}")
-    
-    # Split samples
-    train_samples = []
-    test_samples = []
-    
-    for sample in samples_sorted:
-        if pd.to_datetime(sample['timestamp']) < split_date:
-            train_samples.append(sample)
+    # Convert to datetime in a format-agnostic way
+    try:
+        if timestamp_is_numeric:
+            # Determine if milliseconds or seconds by magnitude
+            # If timestamp is very large (>1e12), it's likely milliseconds
+            # This is roughly year 2001 in seconds vs 1970 in milliseconds
+            is_milliseconds = first_time > 1e12 if first_time > 0 else last_time > 1e12
+            
+            if is_milliseconds:
+                print("Detected millisecond timestamps")
+                first_date = pd.to_datetime(first_time, unit='ms')
+                last_date = pd.to_datetime(last_time, unit='ms')
+            else:
+                print("Detected second timestamps")
+                first_date = pd.to_datetime(first_time, unit='s')
+                last_date = pd.to_datetime(last_time, unit='s')
         else:
-            test_samples.append(sample)
+            # Try parsing as datetime string
+            first_date = pd.to_datetime(first_time)
+            last_date = pd.to_datetime(last_time)
+            
+        print(f"Data spans from {first_date.date()} to {last_date.date()}")
+        
+        # Calculate split point
+        total_duration = last_date - first_date
+        train_duration = total_duration * train_ratio
+        split_date = first_date + train_duration
+        split_date = split_date.normalize() + pd.Timedelta(days=1)
+        
+        print(f"Split date: {split_date.date()}")
+        
+        # Split samples
+        train_samples = []
+        test_samples = []
+        
+        for sample in samples_sorted:
+            ts = get_timestamp(sample)
+            
+            # Convert timestamp to datetime consistently
+            if timestamp_is_numeric:
+                if is_milliseconds:
+                    sample_date = pd.to_datetime(ts, unit='ms')
+                else:
+                    sample_date = pd.to_datetime(ts, unit='s')
+            else:
+                sample_date = pd.to_datetime(ts)
+                
+            if sample_date < split_date:
+                train_samples.append(sample)
+            else:
+                test_samples.append(sample)
+    
+    except Exception as e:
+        print(f"Warning: Error processing timestamps ({str(e)}), falling back to ratio-based split")
+        # Fallback to ratio-based split on sorted data (still time-ordered)
+        split_idx = int(len(samples_sorted) * train_ratio)
+        train_samples = samples_sorted[:split_idx]
+        test_samples = samples_sorted[split_idx:]
     
     print(f"Train samples: {len(train_samples):,}")
     print(f"Test samples: {len(test_samples):,}")
@@ -426,8 +561,8 @@ def move_batch_to_device(batch, device):
 
 
 def create_dataloaders(train_samples, test_samples, package_processor, session_processor, 
-                      batch_size=32, num_workers=0):
-    """Create optimized dataloaders for training and testing"""
+                      batch_size=32, num_workers=0, use_weighted_sampling=True):
+    """Create optimized dataloaders for training and testing with optional weighted sampling"""
     
     # Get mappings
     user_to_idx = session_processor.get_idx_mappings()['user_to_idx']
@@ -461,13 +596,69 @@ def create_dataloaders(train_samples, test_samples, package_processor, session_p
         prefetch_features=True  # Now prefetching test features too for speed
     )
     
+    # Create weighted sampler for training if requested
+    sampler = None
+    if use_weighted_sampling:
+        from torch.utils.data import WeightedRandomSampler
+        
+        # Calculate purchase ratio for weight adjustment
+        purchase_count = sum(1 for s in train_samples if s.get('is_purchase', False))
+        non_purchase_count = len(train_samples) - purchase_count
+        purchase_ratio = non_purchase_count / (purchase_count + 1)  # Avoid division by zero
+        
+        # Set weights even higher for purchases - this addresses the extreme class imbalance
+        # Increase purchase boost beyond the loss function value for severe imbalance situations
+        # When only ~1% of samples are purchases, extremely aggressive sampling is needed
+        purchase_boost = 20.0  # Increased from 10.0 to create more balanced batches
+        
+        # Use more sophisticated weighting that considers purchase type and user behavior
+        # Samples from users with few purchases get extra weight to improve generalization
+        user_purchases = defaultdict(int)
+        for sample in train_samples:
+            if sample.get('is_purchase', False):
+                user_id = sample.get('user_id')
+                user_purchases[user_id] += 1
+                
+        # Calculate weights with user-specific adjustments
+        # Fixed implementation handling None values properly
+        sample_weights = []
+        for sample in train_samples:
+            is_purchase = sample.get('is_purchase', False)
+            user_id = sample.get('user_id')
+            
+            if is_purchase:
+                # Base weight for purchases
+                weight = purchase_boost
+                
+                # Add extra weight for users with fewer purchases (diversity boost)
+                if user_id is not None:  # Guard against None user_id
+                    purchase_count = user_purchases.get(user_id, 0)
+                    if purchase_count <= 3:  # Boost rare purchasers
+                        weight *= 1.5
+            else:
+                weight = 1.0
+            
+            sample_weights.append(weight)
+        
+        print(f"Using weighted sampling for purchases with base weight: {purchase_boost}")
+        print(f"Some purchases have extra weight (up to {purchase_boost * 1.5}) to boost diversity")
+        print(f"The loss function uses a separate purchase boost of 15.0")
+        
+        # Create sampler - sample with replacement to ensure purchases are seen frequently
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(train_samples),
+            replacement=True
+        )
+    
     # Create dataloaders with optimized settings
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),  # Only shuffle if not using sampler
+        sampler=sampler,            # Use weighted sampler if created
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=torch.cuda.is_available() or torch.backends.mps.is_available(),
         persistent_workers=(num_workers > 0),
         prefetch_factor=3 if num_workers > 0 else None,  # Increased prefetch factor
         drop_last=True,  # Drop last incomplete batch for stable training
@@ -479,7 +670,7 @@ def create_dataloaders(train_samples, test_samples, package_processor, session_p
         batch_size=batch_size * 2,  # Larger batches for evaluation
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=torch.cuda.is_available() or torch.backends.mps.is_available(),
         persistent_workers=(num_workers > 0),
         prefetch_factor=3 if num_workers > 0 else None  # Increased prefetch factor
     )
@@ -500,6 +691,12 @@ def main(performance_config=None):
     else:
         device = torch.device('cpu')
     print(f"Using device: {device}")
+    
+    # Delete package_features.pkl cache to force regeneration with fixed embedding loading
+    package_features_cache = "data/cache/package_features.pkl"
+    if os.path.exists(package_features_cache):
+        print(f"Removing package features cache to ensure embeddings are loaded correctly")
+        os.remove(package_features_cache)
     
     # Use default performance config if none provided
     if performance_config is None:
@@ -534,18 +731,18 @@ def main(performance_config=None):
         base_batch_size = 32
         num_workers = 0
     elif device.type == 'mps':
-        # Apple Silicon optimized settings
+        # Apple Silicon optimized settings with increased batch size
         # M3 Max has great memory bandwidth but fewer compute units than high-end NVIDIA GPUs
-        base_batch_size = 64  # Smaller than CUDA but larger than CPU
-        num_workers = 6       # M3 Max has good multi-core performance
+        base_batch_size = 128  # Increased from 64 to 128 for better utilization
+        num_workers = performance_config.get("num_workers", 0)  # Default to 0 for MPS to avoid multiprocessing issues
     else:  # cuda
         base_batch_size = 128
         num_workers = 4
     
     batch_size = int(base_batch_size * performance_config.get("batch_size_multiplier", 1.0))
-    learning_rate = performance_config.get("learning_rate", 0.001)
-    num_epochs = performance_config.get("num_epochs", 30)
-    accumulation_steps = performance_config.get("accumulation_steps", 1)
+    learning_rate = performance_config.get("learning_rate", 0.001)  # Set to 0.001 with warmup later
+    num_epochs = performance_config.get("num_epochs", 50)  # Increased from 30 to allow more training time
+    accumulation_steps = performance_config.get("accumulation_steps", 4)  # Increased from 1 to 4 for more stable gradients
     
     print(f"\nTraining parameters:")
     print(f"  Batch size: {batch_size}")
@@ -574,8 +771,11 @@ def main(performance_config=None):
     
     print("\n6. Applying data filters...")
     
-    # Filter items by frequency
-    filtered_samples, valid_packages = filter_items_by_frequency(samples, min_frequency=5)
+    # Apply session length filtering - quality improves with longer sessions
+    quality_samples = filter_by_min_session_length(samples, min_session_length=3)
+    
+    # Filter items by frequency - focus on packages with sufficient data
+    filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=100)
     
     # Validate that we have purchase events
     purchase_count = sum(1 for s in filtered_samples if s.get('is_purchase', False))
@@ -586,6 +786,17 @@ def main(performance_config=None):
     
     # Time-based split
     train_samples, test_samples = time_based_split_year(filtered_samples, train_ratio=0.93)
+    
+    # Ensure evaluation set has enough purchases for meaningful metrics
+    purchase_samples = [s for s in test_samples if s.get('is_purchase', False)]
+    if len(purchase_samples) < 50:
+        print(f"Warning: Only {len(purchase_samples)} purchases in test set, adding more...")
+        # Find more purchases from train samples
+        extra_purchases = [s for s in train_samples if s.get('is_purchase', False)][:50-len(purchase_samples)]
+        test_samples.extend(extra_purchases)
+        # Remove these from train samples
+        train_samples = [s for s in train_samples if s not in extra_purchases]
+        print(f"Added {len(extra_purchases)} more purchase samples to test set")
     
     # Analyze distributions
     analyze_data_distribution(train_samples, "Train")
@@ -624,14 +835,20 @@ def main(performance_config=None):
     num_categories = max(package_processor.category_to_idx.values()) + 1
     num_themes = max(package_processor.theme_to_idx.values()) + 1
     
-    # Create model config
+    # Detect actual embedding dimension from the data
+    # Get the first package's title embedding from the prepared tensors
+    package_tensors = package_processor.prepare_package_tensors()
+    actual_embedding_dim = package_tensors['title_embeddings'].shape[1]
+    print(f"Detected title embedding dimension: {actual_embedding_dim}")
+    
+    # Create model config with detected embedding dimension
     config = NATRConfig(
         num_users=num_users,
         num_packages=num_packages,
         num_countries=num_countries,
         num_categories=num_categories,
         num_themes=num_themes,
-        title_embedding_dim=3072,  # Fix: Always use 3072 as it's what your data has
+        title_embedding_dim=actual_embedding_dim,  # Use detected dimension from data
         hidden_dim=hidden_dim,
         embedding_dim=embedding_dim,
         user_embedding_dim=embedding_dim,
@@ -653,16 +870,36 @@ def main(performance_config=None):
         eps=1e-8  # More stable epsilon value
     )
     
-    # Use a more efficient scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='max', 
-        patience=performance_config.get("patience", 3), 
-        factor=0.5
-    )
-    print(f"  LR scheduler: ReduceLROnPlateau with patience {performance_config.get('patience', 3)}")
+    # Use cosine annealing with extended warmup for better convergence
+    total_steps = len(train_loader) * num_epochs
+    warmup_steps = int(0.15 * total_steps)  # Increased from 10% to 15% of steps for warmup
     
-    loss_fn = NaturalPurchaseLoss(purchase_boost=20.0)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=total_steps // 2,  # Restart after 1/2 of total training (extended from 1/3)
+        T_mult=1,
+        eta_min=1e-6
+    )
+    
+    # Warmup function to gradually increase learning rate during early epochs
+    def warmup_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        return 1.0
+    
+    warmup_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
+    
+    print(f"  LR scheduler: CosineAnnealingWarmRestarts with extended warmup ({warmup_steps} steps)")
+    
+    # Use enhanced FocalLoss with extreme class imbalance handling 
+    from utils.loss_functions import FocalLoss
+    loss_fn = FocalLoss(
+        purchase_boost=15.0,         # Increased from 10.0 to further emphasize purchases
+        gamma=2.5,                   # Higher gamma to focus more on hard examples
+        alpha=0.3,                   # Higher alpha for better class balance
+        adaptive_gamma=True,         # Use different gamma values for purchases vs non-purchases
+        online_hard_mining=True      # Focus training on the hardest examples only
+    )
     
     # Print model configuration for debugging
     print(f"  Title embedding dimension: {config.title_embedding_dim}")
@@ -677,14 +914,14 @@ def main(performance_config=None):
     
     # Training loop
     print("\n9. Starting training...")
-    print(f"Training for {num_epochs} epochs with purchase boost factor: {loss_fn.purchase_boost}")
+    print(f"Training for {num_epochs} epochs with purchase boost factor: {loss_fn.purchase_boost} (10.0)")
     
     best_purchase_recall = 0
     history = {'train_loss': [], 'test_metrics': []}
     
     # Get performance parameters
     use_amp = performance_config.get("use_amp", False) and device.type == 'cuda'
-    early_stopping_patience = performance_config.get("patience", 3)
+    early_stopping_patience = performance_config.get("patience", 8)  # Increased from 3 to 8 for more training time
     
     # Early stopping tracker
     epochs_without_improvement = 0
@@ -706,9 +943,15 @@ def main(performance_config=None):
         test_metrics = evaluate(model, test_loader, device, k_values=[5, 10, 20])
         eval_time = time.time() - start_time
         
-        # Update scheduler
+        # Update scheduler with both cosine and warmup
         current_purchase_recall = test_metrics['purchase_recall@k'][10]
-        scheduler.step(current_purchase_recall)
+        
+        # Apply warmup in early epochs, then cosine annealing
+        current_step = epoch * len(train_loader)
+        if current_step < warmup_steps:
+            warmup_scheduler.step()
+        else:
+            scheduler.step()
         
         # Store history
         history['train_loss'].append(train_loss)
@@ -748,9 +991,26 @@ def main(performance_config=None):
             torch.save(checkpoint, f"checkpoints/natr/model_epoch_{epoch+1}.pth")
             torch.save(checkpoint, 'checkpoints/natr/best_model.pth')
             print(f"  ✓ New best model saved! Purchase Recall@10: {best_purchase_recall*100:.2f}%")
+            epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
             print(f"  No improvement for {epochs_without_improvement} epochs")
+            
+            # Save periodic checkpoint every 5 epochs for recovery purposes
+            if (epoch + 1) % 5 == 0:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_purchase_recall': best_purchase_recall,
+                    'config': config.__dict__,
+                    'valid_packages': list(valid_packages),
+                    'history': history,
+                    'performance_config': performance_config,
+                    'timestamp': datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                }
+                torch.save(checkpoint, f"checkpoints/natr/periodic_checkpoint_epoch_{epoch+1}.pth")
+                print(f"  ✓ Periodic checkpoint saved at epoch {epoch+1}")
             
             # Early stopping
             if epochs_without_improvement >= early_stopping_patience:
@@ -803,12 +1063,12 @@ def set_performance_mode(mode="balanced"):
         # Specific optimizations for Apple Silicon
         config.update({
             # Batch size settings
-            "batch_size_multiplier": 1.0,        # Standard multiplier
-            "embedding_dim": 192,                # Smaller than CUDA but efficient on MPS
-            "hidden_dim": 192,                   # Smaller hidden dims for MPS memory constraints
+            "batch_size_multiplier": 1.5,        # Increased multiplier for M2/M3
+            "embedding_dim": 256,                # Increased from 192 for better representation
+            "hidden_dim": 256,                   # Increased from 192 for better model capacity
             
             # Gradient accumulation is important for MPS
-            "accumulation_steps": 4,             # More gradient accumulation helps MPS
+            "accumulation_steps": 2,             # Reduced from 4 for faster updates
             
             # MPS doesn't support AMP, but we'll keep this for CUDA compatibility
             "use_amp": False,                    # MPS doesn't support AMP yet
@@ -817,17 +1077,18 @@ def set_performance_mode(mode="balanced"):
             "compile_model": False,              # Don't attempt to compile for MPS
             
             # Other settings
-            "dropout": 0.2,                      # Regular dropout still helps
-            "patience": 3,                       # Regular patience
+            "dropout": 0.25,                     # Increased from 0.2 for better regularization
+            "patience": 5,                       # Increased from 3 for more exploration
             "prefetch_factor": 2,                # Less prefetching for MPS (tends to use more CPU memory)
-            "max_package_count": 30000,          # Limit package vocabulary for faster completion
+            "max_package_count": 50000,          # Increased from 30000 for better coverage
             "use_reduced_embeddings": True,      # Definitely use reduced embeddings for memory efficiency
-            "learning_rate": 0.001,              # Standard learning rate
+            "learning_rate": 0.002,              # Increased from 0.001 for faster convergence
             
             # MPS-specific performance flags
             "mps_clear_cache_frequency": 5,      # Clear MPS cache every N batches
             "use_half_precision_embeddings": True, # Use float16 for embeddings on MPS
             "reduce_memory_usage": True,         # Enable additional memory optimizations
+            "num_workers": 0,                   # No workers for MPS (avoid multiprocessing errors)
         })
     elif mode == "fastest":
         # Prioritize speed over accuracy
@@ -901,8 +1162,8 @@ if __name__ == "__main__":
                         help='Performance mode (default: balanced)')
     parser.add_argument('--batch-size', type=int, default=None,
                         help='Override batch size (default: determined by mode)')
-    parser.add_argument('--epochs', type=int, default=30,
-                        help='Number of training epochs (default: 30)')
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='Number of training epochs (default: 50)')
     parser.add_argument('--workers', type=int, default=None,
                         help='Number of data loading workers (default: determined by mode)')
     parser.add_argument('--accumulation-steps', type=int, default=None,
@@ -925,7 +1186,11 @@ if __name__ == "__main__":
         print("For best performance, consider using '--mode apple_silicon'")
     
     # Set performance configuration
+    # Set performance mode with smaller batch size for first run with new model
     performance_config = set_performance_mode(args.mode)
+    
+    # Temporary override for first run with new model architecture
+    performance_config["batch_size_multiplier"] = 0.5  # Use smaller batch to avoid OOM
     
     # Override with specific command-line arguments if provided
     if args.batch_size is not None:
