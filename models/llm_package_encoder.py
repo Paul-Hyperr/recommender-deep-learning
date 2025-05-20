@@ -64,13 +64,19 @@ class LLMPackageEncoder(nn.Module):
         """Load cached embeddings from file"""
         if os.path.exists(self.cache_file):
             try:
+                print(f"Loading embedding cache from {self.cache_file}")
                 with open(self.cache_file, 'r') as f:
                     cache = json.load(f)
                     # Ensure all values are lists (not numpy arrays)
-                    return {k: v if isinstance(v, list) else v.tolist() for k, v in cache.items()}
+                    processed_cache = {k: v if isinstance(v, list) else v.tolist() for k, v in cache.items()}
+                    print(f"Successfully loaded {len(processed_cache)} embeddings from cache")
+                    return processed_cache
             except Exception as e:
-                print(f"Error loading cache: {e}")
+                print(f"Error loading cache {self.cache_file}: {e}")
+                print(f"Cache file exists: {os.path.exists(self.cache_file)}, size: {os.path.getsize(self.cache_file)} bytes")
                 return {}
+        else:
+            print(f"Cache file not found: {self.cache_file}")
         return {}
     
     def _save_embedding_cache(self):

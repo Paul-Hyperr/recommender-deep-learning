@@ -25,9 +25,11 @@ class ViewLevelAttention(nn.Module):
             nn.Linear(64, 1)
         )
         
-        # Dynamic view-wise scaling factors - these will be learned 
-        # to balance the different information sources (title, location, price, etc.)
-        self.view_scalars = nn.Parameter(torch.ones(6))  # Updated for 6 views
+        # Dynamic view-wise scaling factors with equal weights for price, coordinates, title, and country
+        # Lower weights for category/theme and temporal features
+        # Scaling factor for each view in this order: [title, coord_primary, country, category/theme, price, time]
+        # Values close to 1.0 mean normal importance, higher values increase importance
+        self.view_scalars = nn.Parameter(torch.tensor([1.2, 1.2, 1.2, 0.8, 1.2, 0.6]))  # Initialized weights
         
         # Detect number of views at runtime
         self.num_expected_views = 6  # Updated for 6 views with price
@@ -66,6 +68,7 @@ class ViewLevelAttention(nn.Module):
             
             # Apply view-specific scaling (learned parameter)
             # Use view_idx if it's in bounds, otherwise use default scaling
+            # The view_scalars parameters allow the model to learn the relative importance of each view
             if view_idx < len(self.view_scalars):
                 scale_factor = torch.sigmoid(self.view_scalars[view_idx])  # Sigmoid to keep in [0,1]
                 view = view * scale_factor
@@ -170,8 +173,17 @@ class PackageEncoder(nn.Module):
         self.category_embedding = nn.Embedding(config.num_categories, config.embedding_dim, padding_idx=0)
         self.theme_embedding = nn.Embedding(config.num_themes, config.embedding_dim, padding_idx=0)
         
+        # Separate encoder for country
+        self.country_encoder = nn.Sequential(
+            nn.Linear(config.embedding_dim, config.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.hidden_dim)
+        )
+        
+        # Updated category encoder that combines only category and theme
         self.category_encoder = nn.Sequential(
-            nn.Linear(config.embedding_dim * 3, config.hidden_dim),
+            nn.Linear(config.embedding_dim * 2, config.hidden_dim),
             nn.ReLU(),
             nn.Dropout(config.dropout),
             nn.Linear(config.hidden_dim, config.hidden_dim)
@@ -331,8 +343,11 @@ class PackageEncoder(nn.Module):
                 time_repr = torch.zeros(batch_size, seq_len, self.time_encoder[0].out_features, 
                                        device=batch_data['title_embeddings'].device)
         
-        # Combine categorical embeddings
-        cat_combined = torch.cat([country_emb, category_emb, theme_emb], dim=-1)
+        # Process country embeddings separately
+        country_repr = self.country_encoder(country_emb.view(-1, country_emb.size(-1))).view(batch_size, seq_len, -1)
+        
+        # Combine only category and theme embeddings
+        cat_combined = torch.cat([category_emb, theme_emb], dim=-1)
         cat_repr = self.category_encoder(cat_combined.view(-1, cat_combined.size(-1))).view(batch_size, seq_len, -1)
         
         # Process events with attention mechanism to weight different event types 
@@ -355,16 +370,17 @@ class PackageEncoder(nn.Module):
         title_repr = title_repr + 0.3 * event_encoded  # Increased from 0.1 to 0.3 to strengthen event signal
         
         # Apply view-level attention with all representations
-        # Give geographic data a higher initial weight by introducing it twice
-        # This helps the model prioritize location information, especially important for travel packages
-        # Now include the price representation in the attention mechanism
+        # Equal moderate weights (1.2) are given to title, coordinates, country, and price features
+        # Lower weights are given to category (0.8) and temporal features (0.6)
+        # The order of views must match the order of view_scalars in ViewLevelAttention:
+        # [title, coord_primary, country, category/theme, price, time]
         views = [
-            title_repr,            # Content-based similarity
-            coord_repr,            # Geographic proximity (primary)
-            coord_repr * 0.5,      # Geographic context (secondary)
-            cat_repr,              # Category/theme preferences
-            price_repr,            # NEW: Price-based recommendations
-            time_repr              # Temporal information
+            title_repr,            # Content-based similarity (view index 0 - weight 1.2)
+            coord_repr,            # Geographic proximity (view index 1 - weight 1.2)
+            country_repr,          # Country representation (view index 2 - weight 1.2)
+            cat_repr,              # Category/theme preferences (view index 3 - weight 0.8)
+            price_repr,            # Price-based recommendations (view index 4 - weight 1.2)
+            time_repr              # Temporal information (view index 5 - weight 0.6)
         ]
         unified_repr = self.view_attention(views)
         

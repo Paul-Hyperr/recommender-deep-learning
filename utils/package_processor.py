@@ -54,8 +54,14 @@ class PackageProcessor:
         self.embedding_model = embedding_model
         self.use_reduced_embeddings = use_reduced_embeddings
         
-        # Set embedding dimension based on use_reduced_embeddings
-        self.embedding_dim = 768 if use_reduced_embeddings else 3072
+        # Set embedding dimension based on model 
+        # For text-embedding-3-small, we're using full dimensions to match existing cache
+        if embedding_model == 'text-embedding-3-small':
+            self.embedding_dim = 1536  # Always use full dimensions for small model
+        else:  # text-embedding-3-large
+            self.embedding_dim = 768 if use_reduced_embeddings else 3072
+        
+        print(f"Using embedding model: {embedding_model} with dimension: {self.embedding_dim}")
         
         # Create cache directory if it doesn't exist
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -724,21 +730,49 @@ class PackageProcessor:
         package_to_idx = {str(main_id): idx for idx, main_id in enumerate(sorted(self.package_metadata.keys()))}
         num_packages = len(package_to_idx)
         
-        # Initialize tensors - detect embedding dimension from cache
-        llm_cache_path = os.path.join(self.cache_dir, 'llm_embeddings', 'text-embedding-3-large_cache.json')
-        embedding_dim = 3072  # Default for text-embedding-3-large
+        # Initialize tensors based on the embedding model being used
+        embedding_dim = self.embedding_dim  # Use the dimension specified at initialization
+        
+        # Find the correct cache file for the requested embedding model
+        llm_cache_path = os.path.join(self.cache_dir, 'llm_embeddings', f'{self.embedding_model}_cache.json')
+        
+        if not os.path.exists(llm_cache_path):
+            print(f"Warning: Cache for {self.embedding_model} not found")
+            # Check for other embedding cache files
+            for model_name in ['text-embedding-3-small', 'text-embedding-3-large']:
+                potential_path = os.path.join(self.cache_dir, 'llm_embeddings', f'{model_name}_cache.json')
+                if os.path.exists(potential_path):
+                    print(f"Found alternative embedding cache: {potential_path}")
+                    if model_name != self.embedding_model:
+                        print(f"Warning: Using {model_name} cache, but requested {self.embedding_model}")
+                        print(f"This will lead to dimension mismatch and poor performance")
+                    llm_cache_path = potential_path
+                    break
         
         # Check if we can detect the dimension from cache
         if os.path.exists(llm_cache_path):
             try:
-                print(f"Detecting embedding dimension from cache file: {llm_cache_path}")
+                print(f"Verifying embedding dimension from cache file: {llm_cache_path}")
                 with open(llm_cache_path, 'r') as f:
                     first_key = next(iter(json.load(f).keys()))
                     with open(llm_cache_path, 'r') as f2:
                         embedding = json.load(f2)[first_key]
                         if isinstance(embedding, list):
-                            embedding_dim = len(embedding)
-                            print(f"Detected embedding dimension from cache: {embedding_dim}")
+                            cache_dim = len(embedding)
+                            if cache_dim != self.embedding_dim:
+                                print(f"INFO: Cache dimension {cache_dim}, configured dimension {self.embedding_dim}")
+                                # For text-embedding-3-small, we now expect 1536 dimensions
+                                if self.embedding_model == 'text-embedding-3-small' and cache_dim == 1536:
+                                    print(f"Using full dimensions (1536) for text-embedding-3-small as configured")
+                                    embedding_dim = 1536
+                                # Otherwise, adapt to the cache if reasonable
+                                elif abs(cache_dim - self.embedding_dim) <= 500:
+                                    print(f"Adapting to cache dimension: {cache_dim}")
+                                    embedding_dim = cache_dim
+                                else:
+                                    print(f"Using configured dimension: {self.embedding_dim}")
+                            else:
+                                print(f"Cache dimension matches configured dimension: {embedding_dim}")
             except Exception as e:
                 print(f"Error detecting embedding dimension: {e}, using default: {embedding_dim}")
         
@@ -788,9 +822,27 @@ class PackageProcessor:
                 features = self.get_package_features(main_id_str)
                 
                 if features:
-                    # Title embedding
+                    # Title embedding with dimension handling
                     if features['title_embedding'] is not None:
-                        title_embeddings[idx] = features['title_embedding']
+                        embedding = features['title_embedding']
+                        
+                        # Check for dimension mismatch (should be rare now with correct config)
+                        if embedding.shape[0] != title_embeddings.shape[1]:
+                            # Print warning only once per run
+                            if not hasattr(self, '_dimension_warning_shown'):
+                                print(f"WARNING: Found embedding with dimension {embedding.shape[0]}, expected {title_embeddings.shape[1]}")
+                                print(f"This should be rare now that we're using full dimensions. Handling the mismatch...")
+                                self._dimension_warning_shown = True
+                            
+                            # Handle the rare case of dimension mismatch
+                            if embedding.shape[0] > title_embeddings.shape[1]:
+                                embedding = embedding[:title_embeddings.shape[1]]
+                            else:
+                                padded = np.zeros(title_embeddings.shape[1])
+                                padded[:embedding.shape[0]] = embedding
+                                embedding = padded
+                                
+                        title_embeddings[idx] = embedding
         
         # Load other features (coordinates, categories, etc.)
         print("Loading other features...")
