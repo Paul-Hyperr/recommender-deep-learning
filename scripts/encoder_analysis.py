@@ -27,7 +27,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 # Import encoders
-from models.package_encoder import PackageEncoder
+from models.fasttext_package_encoder import PackageEncoder
 from models.llm_package_encoder import LLMPackageEncoder
 
 def preprocess_dutch_title(title):

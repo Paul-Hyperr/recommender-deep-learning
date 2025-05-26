@@ -25,11 +25,9 @@ class ViewLevelAttention(nn.Module):
             nn.Linear(64, 1)
         )
         
-        # Dynamic view-wise scaling factors with equal weights for price, coordinates, title, and country
-        # Lower weights for category/theme and temporal features
-        # Scaling factor for each view in this order: [title, coord_primary, country, category/theme, price, time]
-        # Values close to 1.0 mean normal importance, higher values increase importance
-        self.view_scalars = nn.Parameter(torch.tensor([1.2, 1.2, 1.2, 0.8, 1.2, 0.6]))  # Initialized weights
+        # Simplified view-wise scaling factors 
+        # Initialize all views with equal importance to prevent bias
+        self.view_scalars = nn.Parameter(torch.ones(6))  # Equal weights for all 6 views
         
         # Detect number of views at runtime
         self.num_expected_views = 6  # Updated for 6 views with price
@@ -67,10 +65,9 @@ class ViewLevelAttention(nn.Module):
                     view = view[..., :self.hidden_dim]
             
             # Apply view-specific scaling (learned parameter)
-            # Use view_idx if it's in bounds, otherwise use default scaling
-            # The view_scalars parameters allow the model to learn the relative importance of each view
+            # Simple linear scaling without sigmoid constraint  
             if view_idx < len(self.view_scalars):
-                scale_factor = torch.sigmoid(self.view_scalars[view_idx])  # Sigmoid to keep in [0,1]
+                scale_factor = self.view_scalars[view_idx]
                 view = view * scale_factor
                 
             processed_views.append(view)
@@ -699,7 +696,7 @@ class NATR(nn.Module):
             nn.Linear(config.hidden_dim, config.hidden_dim * 2),  # Increased capacity
             nn.ReLU(),
             nn.Dropout(config.dropout),
-            nn.BatchNorm1d(config.hidden_dim * 2),  # Added batch norm for stability
+            nn.LayerNorm(config.hidden_dim * 2),  # Use LayerNorm instead of BatchNorm for stability
             nn.Linear(config.hidden_dim * 2, config.num_packages)
         )
         
@@ -748,15 +745,7 @@ class NATR(nn.Module):
         user_final_repr = self.gated_fusion(short_term_pref, long_term_pref, user_emb)
         
         # Make predictions
-        # Handle batch size of 1 case for BatchNorm
-        if user_final_repr.shape[0] == 1 and hasattr(self.prediction_head[3], 'running_mean'):
-            # Skip BatchNorm layer in case of single sample
-            x = self.prediction_head[0](user_final_repr)  # Linear
-            x = self.prediction_head[1](x)  # ReLU
-            x = self.prediction_head[2](x)  # Dropout
-            predictions = self.prediction_head[4](x)  # Final Linear
-        else:
-            predictions = self.prediction_head(user_final_repr)
+        predictions = self.prediction_head(user_final_repr)
         
         # Encode purchased package
         purchased_repr = self.package_encoder(batch['purchased'])

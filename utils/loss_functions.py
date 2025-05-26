@@ -12,7 +12,7 @@ class NaturalPurchaseLoss(nn.Module):
         super().__init__()
         self.purchase_boost = purchase_boost  # Only parameter: how much to boost purchases
         
-    def forward(self, predictions, targets, is_purchase):
+    def forward(self, predictions, targets, is_purchase, has_checkout=None, has_add_to_cart=None):
         """
         Standard cross-entropy with natural purchase weighting
         
@@ -20,16 +20,35 @@ class NaturalPurchaseLoss(nn.Module):
             predictions: Model predictions [batch_size, num_items]
             targets: Target item indices [batch_size]
             is_purchase: Boolean tensor indicating purchases [batch_size]
+            has_checkout: Optional boolean tensor (ignored in this loss function)
+            has_add_to_cart: Optional boolean tensor (ignored in this loss function)
         """
+        # Ensure targets has the right shape for cross_entropy (1D)
+        if len(targets.shape) > 1:
+            targets = targets.squeeze()
+            
+        # Handle zero-sized tensors
+        if targets.numel() == 0:
+            return torch.tensor(0.0, device=predictions.device, requires_grad=True)
+            
         # Basic cross-entropy loss
         ce_loss = F.cross_entropy(predictions, targets, reduction='none')
         
         # Only boost purchases, let model figure out the rest
         weights = torch.ones_like(ce_loss)
-        weights[is_purchase] = self.purchase_boost
+        if is_purchase.any():
+            weights[is_purchase] = self.purchase_boost
         
-        # Return weighted mean
-        return (ce_loss * weights).mean()
+        # Calculate weighted mean
+        loss_val = (ce_loss * weights).mean()
+        
+        # Check for NaN or Inf values
+        if torch.isnan(loss_val) or torch.isinf(loss_val):
+            print(f"Warning: NaN or Inf loss detected in NaturalPurchaseLoss: {loss_val.item()}")
+            # Return a small but non-zero loss value that can be backpropagated
+            return torch.tensor(0.1, device=predictions.device, requires_grad=True)
+            
+        return loss_val
 
 
 class FocalLoss(nn.Module):
@@ -72,6 +91,14 @@ class FocalLoss(nn.Module):
             targets: Target item indices [batch_size]
             is_purchase: Boolean tensor indicating purchases [batch_size]
         """
+        # Ensure targets has the right shape
+        if len(targets.shape) > 1:
+            targets = targets.squeeze()
+            
+        # Handle empty tensor case
+        if targets.numel() == 0:
+            return torch.tensor(0.0, device=predictions.device, requires_grad=True)
+            
         # Get the softmax probs first
         probs = F.softmax(predictions, dim=1)
         
@@ -79,13 +106,17 @@ class FocalLoss(nn.Module):
         batch_size = predictions.size(0)
         pt = torch.zeros(batch_size, device=predictions.device)
         for i in range(batch_size):
-            pt[i] = probs[i, targets[i]]
+            if i < len(targets):  # Ensure index is in range
+                target_idx = targets[i].item()
+                if 0 <= target_idx < predictions.size(1):  # Check target is valid
+                    pt[i] = probs[i, target_idx]
         
         # Adjust gamma based on whether it's a purchase or not (higher gamma for purchases)
         if self.adaptive_gamma:
             gamma = torch.ones_like(pt) * self.base_gamma
             # Increase gamma for purchases to focus more on hard purchase examples
-            gamma[is_purchase] = self.base_gamma * 1.5
+            if is_purchase.any():
+                gamma[is_purchase] = self.base_gamma * 1.5
         else:
             gamma = self.base_gamma
             
@@ -97,7 +128,8 @@ class FocalLoss(nn.Module):
         
         # Add greater boosting for purchases - this creates extreme focus on purchases
         weights = torch.ones_like(weighted_focal_loss)
-        weights[is_purchase] = self.purchase_boost
+        if is_purchase.any():
+            weights[is_purchase] = self.purchase_boost
         
         # Apply harder weights to purchases with lower probabilities (very hard examples)
         purchase_mask = is_purchase.float()
@@ -140,8 +172,16 @@ class FocalLoss(nn.Module):
             non_purchase_loss = (final_loss * non_purchase_mask).sum() / non_purchase_mask.sum()
             self.running_non_purchase_loss = self.beta * self.running_non_purchase_loss + (1 - self.beta) * non_purchase_loss.item()
             
-        # Return weighted mean - normalize by sum of weights for more stable gradients
-        return final_loss.mean()
+        # Calculate weighted mean - normalize by sum of weights for more stable gradients
+        loss_val = final_loss.mean()
+        
+        # Check for NaN or Inf values
+        if torch.isnan(loss_val) or torch.isinf(loss_val):
+            print(f"Warning: NaN or Inf loss detected in FocalLoss: {loss_val.item()}")
+            # Return a small but non-zero loss value that can be backpropagated
+            return torch.tensor(0.1, device=predictions.device, requires_grad=True)
+            
+        return loss_val
 
 
 class ContrastiveEventLoss(nn.Module):
@@ -193,6 +233,14 @@ class ContrastiveEventLoss(nn.Module):
         Returns:
             Loss value
         """
+        # Ensure targets has the right shape
+        if len(targets.shape) > 1:
+            targets = targets.squeeze()
+            
+        # Handle empty tensor case
+        if targets.numel() == 0:
+            return torch.tensor(0.0, device=predictions.device, requires_grad=True)
+            
         # For cross entropy calculation, we need to mask invalid indices (-1)
         valid_mask = (targets >= 0).float()
         
@@ -209,14 +257,33 @@ class ContrastiveEventLoss(nn.Module):
         
         # Only use checkout info if provided
         if has_checkout is not None:
+            # Handle multi-dimensional checkout tensor (squeeze to 1D if needed)
+            if len(has_checkout.shape) > 1:
+                # If has_checkout is 2D or more, take the first element or squeeze
+                if has_checkout.shape[1] == 1:
+                    has_checkout = has_checkout.squeeze(1)
+                else:
+                    # Take the first column as the indicator
+                    has_checkout = has_checkout[:, 0]
+                
             # Only count as checkout if NOT also a purchase
             checkout_mask = has_checkout.float() * (~is_purchase).float()
         
         # Only use add_to_cart info if provided
         if has_add_to_cart is not None:
+            # Handle multi-dimensional add_to_cart tensor (squeeze to 1D if needed)
+            if len(has_add_to_cart.shape) > 1:
+                if has_add_to_cart.shape[1] == 1:
+                    has_add_to_cart = has_add_to_cart.squeeze(1)
+                else:
+                    # Take the first column as the indicator
+                    has_add_to_cart = has_add_to_cart[:, 0]
+                    
             # Only count as add_to_cart if NOT also a purchase or checkout
-            add_to_cart_mask = has_add_to_cart.float() * (~is_purchase).float() * (~has_checkout).float() \
-                if has_checkout is not None else has_add_to_cart.float() * (~is_purchase).float()
+            if has_checkout is not None:
+                add_to_cart_mask = has_add_to_cart.float() * (~is_purchase).float() * (~has_checkout).float()
+            else:
+                add_to_cart_mask = has_add_to_cart.float() * (~is_purchase).float()
         
         # Regular browsing is everything else
         view_mask = 1.0 - purchase_mask - checkout_mask - add_to_cart_mask
@@ -228,35 +295,72 @@ class ContrastiveEventLoss(nn.Module):
         
         batch_size = predictions.size(0)
         for i in range(batch_size):
-            target_idx = targets[i].item()
-            if target_idx >= 0:  # Valid target
-                # Set margin for the target item based on event type
-                if purchase_mask[i] > 0:
-                    # Purchase event - no/minimal margin (easiest to learn)
-                    margins[i, target_idx] = self.purchase_margin
-                elif checkout_mask[i] > 0:
-                    # Checkout event - small margin
-                    margins[i, target_idx] = self.checkout_margin
-                elif add_to_cart_mask[i] > 0:
-                    # Add to cart event - medium margin
-                    margins[i, target_idx] = self.add_to_cart_margin
-                else:
-                    # View event - largest margin (hardest to learn)
-                    margins[i, target_idx] = self.view_margin
+            if i < len(targets):  # Make sure index is valid
+                target_idx = targets[i].item()
+                if target_idx >= 0 and target_idx < predictions.size(1):  # Valid target
+                    # Set margin for the target item based on event type
+                    # Handle potential tensor shape issues - make sure we're getting a scalar value
+                    is_purchase_val = purchase_mask[i].item() if isinstance(purchase_mask[i], torch.Tensor) and purchase_mask[i].numel() == 1 else purchase_mask[i]
+                    
+                    if is_purchase_val > 0:
+                        # Purchase event - no/minimal margin (easiest to learn)
+                        margins[i, target_idx] = self.purchase_margin
+                    else:
+                        # Check checkout - ensure it's a scalar
+                        is_checkout_val = False
+                        if i < len(checkout_mask):
+                            if isinstance(checkout_mask[i], torch.Tensor) and checkout_mask[i].numel() == 1:
+                                is_checkout_val = checkout_mask[i].item() > 0
+                            else:
+                                is_checkout_val = checkout_mask[i] > 0
+                                
+                        # Check add_to_cart - ensure it's a scalar
+                        is_add_to_cart_val = False
+                        if i < len(add_to_cart_mask):
+                            if isinstance(add_to_cart_mask[i], torch.Tensor) and add_to_cart_mask[i].numel() == 1:
+                                is_add_to_cart_val = add_to_cart_mask[i].item() > 0
+                            else:
+                                is_add_to_cart_val = add_to_cart_mask[i] > 0
+                        
+                        # Apply the appropriate margin based on the event type
+                        if is_checkout_val:
+                            # Checkout event - small margin
+                            margins[i, target_idx] = self.checkout_margin
+                        elif is_add_to_cart_val:
+                            # Add to cart event - medium margin
+                            margins[i, target_idx] = self.add_to_cart_margin
+                        else:
+                            # View event - largest margin (hardest to learn)
+                            margins[i, target_idx] = self.view_margin
         
         # Apply margins to logits
         margin_logits = logits - margins
         
         # Calculate cross entropy loss with temperature scaling
-        ce_loss = nn.functional.cross_entropy(margin_logits, targets, reduction='none')
+        try:
+            ce_loss = nn.functional.cross_entropy(margin_logits, targets, reduction='none')
+        except Exception as e:
+            print(f"Error in cross_entropy: {e}")
+            print(f"margin_logits shape: {margin_logits.shape}, targets shape: {targets.shape}")
+            print(f"targets min: {targets.min().item() if targets.numel() > 0 else 'empty'}, max: {targets.max().item() if targets.numel() > 0 else 'empty'}")
+            # Return a zero loss as fallback
+            return torch.tensor(0.0, device=predictions.device, requires_grad=True)
         
         # Apply hard negative mining if enabled
         if self.hard_negative_mining:
             # Sort losses in descending order, but only for view samples
             view_losses = ce_loss * view_mask
             
-            if view_mask.sum() > 10:  # Only if we have enough view samples
-                sorted_losses, _ = torch.sort(view_losses[view_mask > 0], descending=True)
+            # Create a mask for samples where view_mask > 0
+            view_mask_bool = view_mask > 0
+            view_samples_count = view_mask_bool.sum().item()
+            
+            if view_samples_count > 10:  # Only if we have enough view samples
+                # Get view losses for samples with view_mask > 0
+                view_losses_filtered = view_losses[view_mask_bool]
+                
+                # Sort filtered losses
+                sorted_losses, _ = torch.sort(view_losses_filtered, descending=True)
                 
                 # Take top N% hardest samples
                 cutoff_idx = int(len(sorted_losses) * self.hard_negative_ratio)
@@ -284,8 +388,20 @@ class ContrastiveEventLoss(nn.Module):
         # Apply mining mask and valid mask
         masked_loss = ce_loss * mining_mask * valid_mask
         
-        # Return mean loss
-        return masked_loss.sum() / (valid_mask.sum() + 1e-6)
+        # Return mean loss - with safety checks for NaN/Inf values
+        if valid_mask.sum() > 0:
+            # Calculate loss
+            loss_val = masked_loss.sum() / (valid_mask.sum() + 1e-6)
+            
+            # Check for NaN or Inf values
+            if torch.isnan(loss_val) or torch.isinf(loss_val):
+                print(f"Warning: NaN or Inf loss detected: {loss_val.item()}")
+                # Return a small but non-zero loss value that can be backpropagated
+                return torch.tensor(0.1, device=predictions.device, requires_grad=True)
+            
+            return loss_val
+        else:
+            return torch.tensor(0.0, device=predictions.device, requires_grad=True)
     
     def get_margins(self):
         """Return current margin values for reporting"""
@@ -330,6 +446,31 @@ class CheckoutEnhancedLoss(nn.Module):
         Returns:
             Loss value
         """
+        # Ensure targets has the right shape for cross_entropy (1D)
+        if len(targets.shape) > 1:
+            targets = targets.squeeze()
+            
+        # Handle zero-sized tensors - ensure we have at least one valid target
+        if targets.numel() == 0:
+            # Return a zero loss if no targets
+            return torch.tensor(0.0, device=predictions.device, requires_grad=True)
+        
+        # Handle multi-dimensional checkout tensor (squeeze to 1D if needed)
+        if has_checkout is not None and len(has_checkout.shape) > 1:
+            if has_checkout.shape[1] == 1:
+                has_checkout = has_checkout.squeeze(1)
+            else:
+                # Take the first column as the indicator
+                has_checkout = has_checkout[:, 0]
+                
+        # Handle multi-dimensional add_to_cart tensor (squeeze to 1D if needed)
+        if has_add_to_cart is not None and len(has_add_to_cart.shape) > 1:
+            if has_add_to_cart.shape[1] == 1:
+                has_add_to_cart = has_add_to_cart.squeeze(1)
+            else:
+                # Take the first column as the indicator
+                has_add_to_cart = has_add_to_cart[:, 0]
+            
         # Basic cross-entropy loss
         ce_loss = F.cross_entropy(predictions, targets, reduction='none')
         
@@ -337,26 +478,37 @@ class CheckoutEnhancedLoss(nn.Module):
         weights = torch.ones_like(ce_loss)
         
         # Apply purchase boost (highest priority)
-        weights[is_purchase] = self.purchase_boost
+        if is_purchase.any():
+            weights[is_purchase] = self.purchase_boost
         
         # Apply checkout boost (if provided and not a purchase)
-        if has_checkout is not None:
+        if has_checkout is not None and has_checkout.any():
             # Only apply checkout boost if it's not already a purchase
             checkout_only = has_checkout & (~is_purchase)
-            weights[checkout_only] = self.checkout_boost
+            if checkout_only.any():
+                weights[checkout_only] = self.checkout_boost
         
         # Apply add_to_cart boost (if provided and not already boosted)
-        if has_add_to_cart is not None:
+        if has_add_to_cart is not None and has_add_to_cart.any():
             # Only apply if not already a purchase or checkout
             if has_checkout is not None:
                 add_to_cart_only = has_add_to_cart & (~is_purchase) & (~has_checkout)
             else:
                 add_to_cart_only = has_add_to_cart & (~is_purchase)
             
-            weights[add_to_cart_only] = self.add_to_cart_boost
+            if add_to_cart_only.any():
+                weights[add_to_cart_only] = self.add_to_cart_boost
         
-        # Return weighted mean loss
-        return (ce_loss * weights).mean()
+        # Calculate weighted mean loss
+        loss_val = (ce_loss * weights).mean()
+        
+        # Check for NaN or Inf values
+        if torch.isnan(loss_val) or torch.isinf(loss_val):
+            print(f"Warning: NaN or Inf loss detected in CheckoutEnhancedLoss: {loss_val.item()}")
+            # Return a small but non-zero loss value that can be backpropagated
+            return torch.tensor(0.1, device=predictions.device, requires_grad=True)
+            
+        return loss_val
 
 
 class PurchaseFocusedMetrics:
@@ -378,14 +530,21 @@ class PurchaseFocusedMetrics:
             'recall@k': {k: 0.0 for k in k_values},
             'purchase_recall@k': {k: 0.0 for k in k_values},
             'purchase_mrr': 0.0,
-            'overall_mrr': 0.0
+            'overall_mrr': 0.0,
+            'purchase_count': is_purchase.sum().item()
         }
         
-        purchase_count = is_purchase.sum().item()
+        purchase_count = metrics['purchase_count']
+        
+        # Check for any unusual tensor shapes and fix if needed
+        if len(targets.shape) > 1:
+            # If targets has shape [batch_size, 1] or similar, flatten it
+            targets = targets.view(-1)
         
         # Vectorized rank calculation
-        # Expand targets to match shape of top_k_indices for efficient comparison
-        expanded_targets = targets.unsqueeze(1).expand_as(top_k_indices)
+        # Ensure targets has the right shape before expanding
+        targets_flat = targets.view(-1)
+        expanded_targets = targets_flat.unsqueeze(1).expand(-1, top_k_indices.size(1))
         matches = (top_k_indices == expanded_targets)
         
         # Get the first match position for each sample
@@ -494,8 +653,15 @@ class EnhancedEventMetrics:
         metrics['purchase_count'] = purchase_count
         metrics['total_count'] = batch_size
         
+        # Check for any unusual tensor shapes and fix if needed
+        if len(targets.shape) > 1:
+            # If targets has shape [batch_size, 1] or similar, flatten it
+            targets = targets.view(-1)
+        
         # Vectorized rank calculation
-        expanded_targets = targets.unsqueeze(1).expand_as(top_k_indices)
+        # Ensure targets has the right shape before expanding
+        targets_flat = targets.view(-1)
+        expanded_targets = targets_flat.unsqueeze(1).expand(-1, top_k_indices.size(1))
         matches = (top_k_indices == expanded_targets)
         
         # Get position of first match for each sample 

@@ -250,7 +250,25 @@ class PackageProcessor:
                         
                         # IMPORTANT: Load/generate embeddings if requested and add to metadata
                         if self.load_embeddings:
-                            self._generate_embeddings()
+                            # First try loading from LLM embedding cache directly
+                            llm_cache_path = os.path.join(self.cache_dir, 'llm_embeddings', f'{self.embedding_model}_cache.json')
+                            if os.path.exists(llm_cache_path):
+                                try:
+                                    print(f"Loading embeddings directly from {llm_cache_path}")
+                                    with open(llm_cache_path, 'r') as f:
+                                        embedding_cache = json.load(f)
+                                        for main_id_str, embedding in embedding_cache.items():
+                                            if isinstance(embedding, list):
+                                                self.package_embeddings[main_id_str] = np.array(embedding)
+                                            else:
+                                                self.package_embeddings[main_id_str] = embedding
+                                    print(f"Loaded {len(self.package_embeddings)} embeddings directly from cache")
+                                except Exception as e:
+                                    print(f"Error loading embeddings directly: {e}, falling back to normal method")
+                                    self._generate_embeddings()
+                            else:
+                                self._generate_embeddings()
+                                
                             # Add embeddings to metadata if not already there
                             for main_id_str in self.package_metadata:
                                 if main_id_str in self.package_embeddings:
@@ -520,7 +538,24 @@ class PackageProcessor:
         
         # Generate embeddings after all metadata is loaded
         if self.load_embeddings:
-            self._generate_embeddings()
+            # First try loading from LLM embedding cache directly
+            llm_cache_path = os.path.join(self.cache_dir, 'llm_embeddings', f'{self.embedding_model}_cache.json')
+            if os.path.exists(llm_cache_path):
+                try:
+                    print(f"Loading embeddings directly from {llm_cache_path}")
+                    with open(llm_cache_path, 'r') as f:
+                        embedding_cache = json.load(f)
+                        for main_id_str, embedding in embedding_cache.items():
+                            if isinstance(embedding, list):
+                                self.package_embeddings[main_id_str] = np.array(embedding)
+                            else:
+                                self.package_embeddings[main_id_str] = embedding
+                    print(f"Loaded {len(self.package_embeddings)} embeddings directly from cache")
+                except Exception as e:
+                    print(f"Error loading embeddings directly: {e}, falling back to normal method")
+                    self._generate_embeddings()
+            else:
+                self._generate_embeddings()
         
         # Now add embeddings to metadata - use string keys
         for main_id_str in self.package_metadata:
@@ -1052,7 +1087,7 @@ class TravelPackageDataset(Dataset):
                 max_long_term: int = 20,
                 empty_token: int = -1,  
                 unknown_token: int = -1,
-                use_cache: bool = True,
+                use_cache: bool = False,  # Disabled by default to avoid stale cache issues
                 prefetch_features: bool = True):
         """Initialize with optimizations"""
         
@@ -1160,6 +1195,15 @@ class TravelPackageDataset(Dataset):
         has_short_term = np.zeros(batch_size, dtype=bool)
         is_purchase = np.zeros(batch_size, dtype=bool)
         
+        # Pre-computed event flags for consistent evaluation
+        has_checkout = np.zeros(batch_size, dtype=bool)
+        has_add_to_cart = np.zeros(batch_size, dtype=bool)
+        is_cold_start = np.zeros(batch_size, dtype=bool)
+        
+        # Inclusive event flags (for individual event recalls)
+        has_checkout_inclusive = np.zeros(batch_size, dtype=bool)
+        has_add_to_cart_inclusive = np.zeros(batch_size, dtype=bool)
+        
         # Short-term arrays
         st_packages = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
         st_events = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
@@ -1195,6 +1239,15 @@ class TravelPackageDataset(Dataset):
             user_ids[i] = self.user_to_idx.get(sample['user_id'], 0)
             has_short_term[i] = len(sample.get('short_term_packages', [])) > 0
             is_purchase[i] = sample.get('is_purchase', False)
+            
+            # Extract pre-computed event flags for consistent evaluation
+            has_checkout[i] = sample.get('has_checkout', False)
+            has_add_to_cart[i] = sample.get('has_add_to_cart', False)
+            is_cold_start[i] = sample.get('is_cold_start', False)
+            
+            # Extract inclusive flags for individual event recalls
+            has_checkout_inclusive[i] = sample.get('has_checkout_inclusive', False)
+            has_add_to_cart_inclusive[i] = sample.get('has_add_to_cart_inclusive', False)
             
             # Process short-term
             if has_short_term[i]:
@@ -1254,6 +1307,11 @@ class TravelPackageDataset(Dataset):
             'user_ids': torch.from_numpy(user_ids),
             'has_short_term': torch.from_numpy(has_short_term),
             'is_purchase': torch.from_numpy(is_purchase),
+            'has_checkout': torch.from_numpy(has_checkout),
+            'has_add_to_cart': torch.from_numpy(has_add_to_cart),
+            'is_cold_start': torch.from_numpy(is_cold_start),
+            'has_checkout_inclusive': torch.from_numpy(has_checkout_inclusive),
+            'has_add_to_cart_inclusive': torch.from_numpy(has_add_to_cart_inclusive),
             'short_term_packages': torch.from_numpy(st_packages),
             'short_term_events': torch.from_numpy(st_events),
             'short_term_countries': torch.from_numpy(st_countries),
@@ -1317,6 +1375,11 @@ class TravelPackageDataset(Dataset):
             'user_id': user_id,
             'has_short_term': self.has_short_term[idx],
             'is_purchase': self.is_purchase[idx],
+            'has_checkout': self.has_checkout[idx] if hasattr(self, 'has_checkout') else False,
+            'has_add_to_cart': self.has_add_to_cart[idx] if hasattr(self, 'has_add_to_cart') else False,
+            'is_cold_start': self.is_cold_start[idx] if hasattr(self, 'is_cold_start') else False,
+            'has_checkout_inclusive': self.has_checkout_inclusive[idx] if hasattr(self, 'has_checkout_inclusive') else False,
+            'has_add_to_cart_inclusive': self.has_add_to_cart_inclusive[idx] if hasattr(self, 'has_add_to_cart_inclusive') else False,
             
             'short_term': {
                 'package_ids': self.short_term_packages[idx],

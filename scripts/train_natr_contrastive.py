@@ -30,706 +30,55 @@ if hasattr(torch, 'set_float32_matmul_precision'):
 # Import all necessary components
 from models.natr import NATR, NATRConfig
 from utils.session_processor import SessionProcessor
-from utils.package_processor import PackageProcessor, TravelPackageDataset
+from utils.package_processor import PackageProcessor
 from utils.loss_functions import ContrastiveEventLoss, EnhancedEventMetrics
 
-
-def filter_by_min_session_length(samples, min_session_length=3):
-    """Filter out sessions that are too short for quality training"""
-    print(f"\nFiltering sessions by length (min: {min_session_length})...")
-    
-    # Count samples before
-    total_before = len(samples)
-    
-    # Group samples by user
-    user_samples = {}
-    for sample in samples:
-        user_id = sample.get('user_id')
-        if user_id not in user_samples:
-            user_samples[user_id] = []
-        user_samples[user_id].append(sample)
-    
-    # Filter by session length while preserving at least one sample per user
-    quality_samples = []
-    users_with_no_quality_sessions = 0
-    
-    for user_id, user_session_samples in user_samples.items():
-        # First find quality samples for this user
-        user_quality_samples = []
-        
-        for sample in user_session_samples:
-            # Count interactions in short-term
-            short_term_length = len(sample.get('short_term_packages', []))
-            
-            # Only keep samples with sufficient interactions
-            if short_term_length >= min_session_length:
-                user_quality_samples.append(sample)
-        
-        # If user has quality samples, add them all
-        if user_quality_samples:
-            quality_samples.extend(user_quality_samples)
-        # If user has no quality samples but has purchase or checkout samples, keep those
-        else:
-            # Find purchase, checkout or add_to_cart samples for this user
-            important_samples = [
-                s for s in user_session_samples if 
-                s.get('is_purchase', False) or 
-                s.get('has_checkout', False) or
-                s.get('has_add_to_cart', False)
-            ]
-            
-            if important_samples:
-                # Keep all important samples even if they're short
-                quality_samples.extend(important_samples)
-            else:
-                # Otherwise keep their longest session
-                if user_session_samples:
-                    best_sample = max(user_session_samples, 
-                                     key=lambda s: len(s.get('short_term_packages', [])))
-                    quality_samples.append(best_sample)
-                    
-            users_with_no_quality_sessions += 1
-    
-    # Count samples after
-    total_after = len(quality_samples)
-    
-    print(f"Samples after session length filtering: {total_after} ({total_after/total_before*100:.1f}%)")
-    print(f"Users without quality sessions (fallback to best): {users_with_no_quality_sessions}")
-    
-    return quality_samples
+# Import consolidated utilities
+from utils.training_utils import (
+    filter_by_min_session_length,
+    filter_items_by_frequency,
+    time_based_split_year,
+    identify_event_types,
+    ensure_balanced_test_set,
+    move_batch_to_device,
+    train_epoch,
+    evaluate,
+    create_dataloaders,
+    analyze_data_distribution,
+    set_performance_mode,
+    clear_memory,
+    limit_samples_for_testing
+)
 
 
-def filter_items_by_frequency(samples, min_frequency=50):
-    """Filter items that appear less than min_frequency times"""
-    print(f"\nFiltering items by frequency (min: {min_frequency})...")
-    
-    # Separate samples by type
-    purchase_samples = [s for s in samples if s.get('is_purchase', False)]
-    checkout_samples = [s for s in samples if (not s.get('is_purchase', False) and s.get('has_checkout', False))]
-    add_to_cart_samples = [s for s in samples if (not s.get('is_purchase', False) and not s.get('has_checkout', False) 
-                                                and s.get('has_add_to_cart', False))]
-    regular_samples = [s for s in samples if 
-                     (not s.get('is_purchase', False) and not s.get('has_checkout', False) and not s.get('has_add_to_cart', False))]
-    
-    # Get all packages that were part of important events
-    retained_packages = set()
-    
-    for sample in purchase_samples:
-        purchased = str(sample.get('purchased_package', ''))
-        if purchased:
-            retained_packages.add(purchased)
-            
-    for sample in checkout_samples:
-        checkout = str(sample.get('checkout_package', ''))
-        if checkout:
-            retained_packages.add(checkout)
-    
-    for sample in add_to_cart_samples:
-        add_to_cart = str(sample.get('add_to_cart_package', ''))
-        if add_to_cart:
-            retained_packages.add(add_to_cart)
-    
-    print(f"Found {len(retained_packages)} unique packages from important events (will be preserved)")
-    
-    # Count package occurrences efficiently
-    package_counts = Counter()
-    
-    for sample in samples:
-        # Count all packages
-        all_packages = []
-        all_packages.extend(sample.get('short_term_packages', []))
-        all_packages.extend(sample.get('long_term_packages', []))
-        all_packages.append(sample.get('purchased_package'))
-        
-        for pkg in all_packages:
-            if pkg:
-                package_counts[str(pkg)] += 1
-    
-    # Find valid packages - include all important packages plus frequent ones
-    valid_packages = {pkg for pkg, count in package_counts.items() 
-                     if count >= min_frequency or pkg in retained_packages}
-    print(f"Valid packages: {len(valid_packages)} out of {len(package_counts)}")
-    
-    # All important samples are kept
-    filtered_samples = list(purchase_samples + checkout_samples + add_to_cart_samples)
-    
-    # For regular samples, filter packages
-    for sample in regular_samples:
-        # Filter packages in sequences
-        sample_copy = sample.copy()
-        sample_copy['short_term_packages'] = [pkg for pkg in sample.get('short_term_packages', []) 
-                                          if str(pkg) in valid_packages]
-        sample_copy['long_term_packages'] = [pkg for pkg in sample.get('long_term_packages', []) 
-                                         if str(pkg) in valid_packages]
-        
-        # Keep sample if it has valid packages
-        if sample_copy['short_term_packages'] or sample_copy['long_term_packages']:
-            filtered_samples.append(sample_copy)
-    
-    print(f"Samples after filtering: {len(filtered_samples)} ({len(filtered_samples)/len(samples)*100:.1f}%)")
-    print(f"Purchase samples preserved: {len(purchase_samples)} (100%)")
-    print(f"Checkout samples preserved: {len(checkout_samples)} (100%)")
-    print(f"Add-to-cart samples preserved: {len(add_to_cart_samples)} (100%)")
-    
-    return filtered_samples, valid_packages
-
-
-def time_based_split_year(samples, train_ratio=0.93):
-    """Split samples based on time for a year of data"""
-    print(f"\nApplying time-based split ({train_ratio*100:.0f}% train, {(1-train_ratio)*100:.0f}% test)...")
-    
-    # Check if timestamps exist
-    if not samples or 'timestamp' not in samples[0]:
-        print("Warning: No timestamps found, using random split")
-        indices = np.random.permutation(len(samples))
-        split_idx = int(len(samples) * train_ratio)
-        return [samples[i] for i in indices[:split_idx]], [samples[i] for i in indices[split_idx:]]
-    
-    # Determine if timestamps are epoch or datetime strings
-    # Try to infer timestamp format from first sample
-    first_timestamp = samples[0]['timestamp']
-    timestamp_is_numeric = isinstance(first_timestamp, (int, float)) or \
-                          (isinstance(first_timestamp, str) and first_timestamp.isdigit())
-    
-    # Define sorting key function based on format
-    def get_timestamp(sample):
-        ts = sample.get('timestamp', 0)
-        if timestamp_is_numeric:
-            # Convert string numbers to float if needed
-            return float(ts) if isinstance(ts, str) else ts
-        else:
-            # Keep as is for datetime conversion later
-            return ts
-    
-    # Sort by timestamp
-    samples_sorted = sorted(samples, key=get_timestamp)
-    
-    # Get time range
-    first_time = get_timestamp(samples_sorted[0])
-    last_time = get_timestamp(samples_sorted[-1])
-    
-    # Convert to datetime in a format-agnostic way
-    try:
-        if timestamp_is_numeric:
-            # Determine if milliseconds or seconds by magnitude
-            # If timestamp is very large (>1e12), it's likely milliseconds
-            # This is roughly year 2001 in seconds vs 1970 in milliseconds
-            is_milliseconds = first_time > 1e12 if first_time > 0 else last_time > 1e12
-            
-            if is_milliseconds:
-                print("Detected millisecond timestamps")
-                first_date = pd.to_datetime(first_time, unit='ms')
-                last_date = pd.to_datetime(last_time, unit='ms')
-            else:
-                print("Detected second timestamps")
-                first_date = pd.to_datetime(first_time, unit='s')
-                last_date = pd.to_datetime(last_time, unit='s')
-        else:
-            # Try parsing as datetime string
-            first_date = pd.to_datetime(first_time)
-            last_date = pd.to_datetime(last_time)
-            
-        print(f"Data spans from {first_date.date()} to {last_date.date()}")
-        
-        # Calculate split point
-        total_duration = last_date - first_date
-        train_duration = total_duration * train_ratio
-        split_date = first_date + train_duration
-        split_date = split_date.normalize() + pd.Timedelta(days=1)
-        
-        print(f"Split date: {split_date.date()}")
-        
-        # Split samples
-        train_samples = []
-        test_samples = []
-        
-        for sample in samples_sorted:
-            ts = get_timestamp(sample)
-            
-            # Convert timestamp to datetime consistently
-            if timestamp_is_numeric:
-                if is_milliseconds:
-                    sample_date = pd.to_datetime(ts, unit='ms')
-                else:
-                    sample_date = pd.to_datetime(ts, unit='s')
-            else:
-                sample_date = pd.to_datetime(ts)
-                
-            if sample_date < split_date:
-                train_samples.append(sample)
-            else:
-                test_samples.append(sample)
-    
-    except Exception as e:
-        print(f"Warning: Error processing timestamps ({str(e)}), falling back to ratio-based split")
-        # Fallback to ratio-based split on sorted data (still time-ordered)
-        split_idx = int(len(samples_sorted) * train_ratio)
-        train_samples = samples_sorted[:split_idx]
-        test_samples = samples_sorted[split_idx:]
-    
-    print(f"Train samples: {len(train_samples):,}")
-    print(f"Test samples: {len(test_samples):,}")
-    
-    return train_samples, test_samples
-
-
-def analyze_data_distribution(samples, name="Dataset"):
-    """Analyze the distribution of data with all event types"""
-    purchase_count = sum(1 for s in samples if s.get('is_purchase', False))
-    checkout_count = sum(1 for s in samples if not s.get('is_purchase', False) and s.get('has_checkout', False))
-    add_to_cart_count = sum(1 for s in samples if not s.get('is_purchase', False) and 
-                          not s.get('has_checkout', False) and s.get('has_add_to_cart', False))
-    view_count = len(samples) - purchase_count - checkout_count - add_to_cart_count
-    
-    print(f"\n{name} Distribution:")
-    print(f"  Total samples: {len(samples):,}")
-    print(f"  Purchases: {purchase_count:,} ({purchase_count/len(samples)*100:.2f}%)")
-    print(f"  Checkout events: {checkout_count:,} ({checkout_count/len(samples)*100:.2f}%)")
-    print(f"  Add-to-cart events: {add_to_cart_count:,} ({add_to_cart_count/len(samples)*100:.2f}%)")
-    print(f"  Purchase + Checkout + Cart: {purchase_count + checkout_count + add_to_cart_count:,} " + 
-          f"({(purchase_count + checkout_count + add_to_cart_count)/len(samples)*100:.2f}%)")
-    print(f"  View-only browsing: {view_count:,} ({view_count/len(samples)*100:.2f}%)")
-
-
-def identify_event_types(samples, session_processor):
-    """
-    Identify and mark samples with different event types
-    Implements a hierarchy of event importance:
-    1. Purchase (strongest signal)
-    2. InitiateCheckout (strong intent)
-    3. AddToCart (medium intent)
-    4. ViewContent (baseline)
-    
-    Samples can only have one type based on the hierarchy
-    """
-    print("\nIdentifying samples with different event types...")
-    
-    # Get event mappings
-    event_to_idx = session_processor.get_idx_mappings()['event_to_idx']
-    idx_to_event = {v: k for k, v in event_to_idx.items()}
-    
-    checkout_event_idx = event_to_idx.get('InitiateCheckout')
-    add_to_cart_event_idx = event_to_idx.get('AddToCart')
-    
-    if not checkout_event_idx:
-        print("Warning: 'InitiateCheckout' event not found in mapping")
-    
-    if not add_to_cart_event_idx:
-        print("Warning: 'AddToCart' event not found in mapping")
-    
-    print(f"InitiateCheckout event index: {checkout_event_idx}")
-    print(f"AddToCart event index: {add_to_cart_event_idx}")
-    
-    # Process samples to identify event types
-    enhanced_samples = []
-    checkout_count = 0
-    add_to_cart_count = 0
-    purchase_with_checkout_count = 0
-    purchase_with_cart_count = 0
-    
-    for sample in samples:
-        # Add event flags (all false by default)
-        sample_copy = sample.copy()
-        sample_copy['has_checkout'] = False
-        sample_copy['has_add_to_cart'] = False
-        
-        # Check if sample has short-term events
-        short_term_events = sample_copy.get('short_term_events', [])
-        short_term_pkgs = sample_copy.get('short_term_packages', [])
-        
-        # Early skip for purchase samples - they already have the strongest signal
-        if sample_copy.get('is_purchase', False):
-            # Check for both checkout and purchase - just for statistics
-            if checkout_event_idx and checkout_event_idx in short_term_events:
-                purchase_with_checkout_count += 1
-                
-            # Check for both add-to-cart and purchase - just for statistics
-            if add_to_cart_event_idx and add_to_cart_event_idx in short_term_events:
-                purchase_with_cart_count += 1
-                
-            enhanced_samples.append(sample_copy)
-            continue
-            
-        # CHECKOUT: Look for InitiateCheckout events in short-term sequence
-        if checkout_event_idx and checkout_event_idx in short_term_events:
-            # Get the most recent checkout package
-            checkout_package = None
-            for i, event_idx in enumerate(reversed(short_term_events)):
-                if event_idx == checkout_event_idx:
-                    # Get the package associated with this checkout
-                    rev_index = len(short_term_events) - 1 - i
-                    if rev_index < len(short_term_pkgs):
-                        checkout_package = short_term_pkgs[rev_index]
-                    break
-            
-            # Mark as checkout and set the checkout package
-            if checkout_package:
-                sample_copy['has_checkout'] = True
-                sample_copy['checkout_package'] = checkout_package
-                sample_copy['purchased_package'] = checkout_package  # Use as target
-                checkout_count += 1
-                enhanced_samples.append(sample_copy)
-                continue
-        
-        # ADD TO CART: Only if not a purchase or checkout
-        if add_to_cart_event_idx and add_to_cart_event_idx in short_term_events:
-            # Get the most recent add-to-cart package
-            add_to_cart_package = None
-            for i, event_idx in enumerate(reversed(short_term_events)):
-                if event_idx == add_to_cart_event_idx:
-                    # Get the package associated with this add-to-cart
-                    rev_index = len(short_term_events) - 1 - i
-                    if rev_index < len(short_term_pkgs):
-                        add_to_cart_package = short_term_pkgs[rev_index]
-                    break
-            
-            # Mark as add-to-cart and set the add-to-cart package
-            if add_to_cart_package:
-                sample_copy['has_add_to_cart'] = True
-                sample_copy['add_to_cart_package'] = add_to_cart_package
-                sample_copy['purchased_package'] = add_to_cart_package  # Use as target
-                add_to_cart_count += 1
-                enhanced_samples.append(sample_copy)
-                continue
-        
-        # VIEW CONTENT: Regular browsing sample - no special handling
-        enhanced_samples.append(sample_copy)
-    
-    print(f"Identified {checkout_count} checkout-only samples")
-    print(f"Identified {add_to_cart_count} add-to-cart-only samples")
-    print(f"Found {purchase_with_checkout_count} samples with both purchase and checkout events")
-    print(f"Found {purchase_with_cart_count} samples with both purchase and add-to-cart events")
-    
-    return enhanced_samples
-
-
-def move_batch_to_device(batch, device):
-    """Recursively move batch to device with optimized handling for both CUDA and MPS"""
-    if isinstance(batch, dict):
-        # Process in single pass to reduce Python overhead
-        return {k: move_batch_to_device(v, device) for k, v in batch.items()}
-    elif isinstance(batch, torch.Tensor):
-        is_large_tensor = batch.numel() > 1000
-        
-        # Device-specific optimizations
-        if device.type == 'cuda' and batch.dtype == torch.int64 and \
-           is_large_tensor and not batch.requires_grad:
-            # Convert CPU int64 to int32 for efficiency on CUDA
-            return batch.type(torch.int32).to(device, non_blocking=True)
-        elif device.type == 'mps':
-            # MPS optimizations
-            if batch.dtype == torch.int64 and is_large_tensor and not batch.requires_grad:
-                # Convert large integer tensors to int32 for MPS as well
-                return batch.type(torch.int32).to(device, non_blocking=True)
-            elif batch.dtype == torch.float64:
-                # Convert double to float, as MPS works better with float32
-                return batch.type(torch.float32).to(device, non_blocking=True)
-            else:
-                # Default case
-                return batch.to(device, non_blocking=True)
-        else:
-            # CPU or other default handling
-            return batch.to(device, non_blocking=True)
-    elif isinstance(batch, list) and batch and isinstance(batch[0], torch.Tensor):
-        # Handle lists of tensors more efficiently
-        return [t.to(device, non_blocking=True) for t in batch]
-    else:
-        return batch
-
-
-def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, 
-            accumulation_steps=1, use_amp=False):
-    """Train for one epoch with optimizations, with specific enhancements for MPS"""
-    model.train()
-    total_loss = 0
-    num_batches = 0
-    
-    # Use mixed precision if specified and available
-    # Note: As of PyTorch 2.0+, MPS doesn't support AMP yet
-    use_amp = use_amp and device.type == 'cuda' and hasattr(torch.cuda, 'amp')
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
-    
-    # MPS-specific memory management
-    is_mps = device.type == 'mps'
-    mps_memory_optimization = is_mps
-    
-    # Create a progress bar that updates less frequently
-    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}", 
-                        mininterval=10.0,  # Update at most every 10 seconds
-                        miniters=1000)      # Update after at least 1000 iterations
-    
-    optimizer.zero_grad()
-    
-    # Track peak memory usage for MPS
-    if is_mps and hasattr(torch.mps, 'current_allocated_memory'):
-        peak_memory = 0
-    
-    for batch_idx, batch in enumerate(progress_bar):
-        # Move batch to device
-        batch = move_batch_to_device(batch, device)
-        
-        # Mixed precision forward pass
-        if use_amp:
-            with torch.cuda.amp.autocast():
-                outputs = model(batch)
-                predictions = outputs['predictions']
-                
-                # Get targets
-                targets = batch['purchased']['package_ids']
-                
-                # Get event type flags
-                is_purchase = batch.get('is_purchase', torch.zeros_like(targets, dtype=torch.bool))
-                has_checkout = batch.get('has_checkout', torch.zeros_like(targets, dtype=torch.bool))
-                has_add_to_cart = batch.get('has_add_to_cart', torch.zeros_like(targets, dtype=torch.bool))
-                
-                # Calculate loss with contrastive margins for different event types
-                loss = loss_fn(predictions, targets, is_purchase, has_checkout, has_add_to_cart)
-                loss = loss / accumulation_steps  # Scale for accumulation
-            
-            # Backward pass with scaling
-            scaler.scale(loss).backward()
-        else:
-            # Print batch structure for debugging (just for the first batch of first epoch)
-            if batch_idx == 0 and epoch == 0:
-                print("Batch structure:")
-                for k in batch:
-                    if isinstance(batch[k], dict):
-                        print(f"  {k}:")
-                        for k2 in batch[k]:
-                            print(f"    {k2}: {type(batch[k][k2])} {batch[k][k2].shape if hasattr(batch[k][k2], 'shape') else ''}")
-                    elif isinstance(batch[k], torch.Tensor):
-                        print(f"  {k}: {batch[k].shape}")
-                    else:
-                        print(f"  {k}: {type(batch[k])}")
-            
-            # Standard forward pass
-            outputs = model(batch)
-            predictions = outputs['predictions']
-            
-            # Get targets
-            targets = batch['purchased']['package_ids']
-            
-            # Get event type flags
-            is_purchase = batch.get('is_purchase', torch.zeros_like(targets, dtype=torch.bool))
-            has_checkout = batch.get('has_checkout', torch.zeros_like(targets, dtype=torch.bool))
-            has_add_to_cart = batch.get('has_add_to_cart', torch.zeros_like(targets, dtype=torch.bool))
-            
-            # Calculate loss with contrastive margins for different event types
-            loss = loss_fn(predictions, targets, is_purchase, has_checkout, has_add_to_cart)
-            loss = loss / accumulation_steps  # Scale for accumulation
-            
-            # Backward pass
-            loss.backward()
-            
-            # MPS memory tracking for debugging
-            if is_mps and hasattr(torch.mps, 'current_allocated_memory'):
-                current_memory = torch.mps.current_allocated_memory() / (1024 * 1024)  # MB
-                peak_memory = max(peak_memory, current_memory)
-        
-        # Update metrics
-        total_loss += loss.item() * accumulation_steps
-        num_batches += 1
-        
-        # Step optimizer after accumulation
-        if (batch_idx + 1) % accumulation_steps == 0:
-            if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad()
-            
-            # MPS-specific memory management - clear cache periodically
-            if mps_memory_optimization and (batch_idx + 1) % (accumulation_steps * 5) == 0:
-                torch.mps.empty_cache()
-        
-        # Update progress bar with more detailed info
-        postfix = {
-            'loss': total_loss / num_batches,
-            'lr': optimizer.param_groups[0]['lr']
-        }
-        
-        # Add memory info for MPS
-        if is_mps and hasattr(torch.mps, 'current_allocated_memory'):
-            postfix['mem_mb'] = f"{torch.mps.current_allocated_memory() / (1024 * 1024):.0f}"
-            
-        progress_bar.set_postfix(postfix)
-    
-    # Handle remaining gradients
-    if (batch_idx + 1) % accumulation_steps != 0:
-        if use_amp:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        optimizer.zero_grad()
-    
-    # Final MPS memory cleanup
-    if is_mps:
-        torch.mps.empty_cache()
-        if hasattr(torch.mps, 'current_allocated_memory'):
-            print(f"MPS peak memory usage: {peak_memory:.2f} MB")
-    
-    return total_loss / num_batches
-
-
-def evaluate(model, test_loader, device, k_values=[5, 10, 20]):
-    """Evaluate model with enhanced metrics for different event types"""
-    model.eval()
-    
-    # Initialize metrics accumulator
-    metrics_acc = defaultdict(float)
-    event_type_counts = defaultdict(int)
-    
-    # MPS-specific optimization
-    is_mps = device.type == 'mps'
-    
-    with torch.no_grad():
-        # Handle MPS garbage collection
-        if is_mps:
-            torch.mps.empty_cache()
-        
-        # Use smaller batches for evaluation on MPS to avoid OOM
-        progress_bar = tqdm(test_loader, desc="Evaluating",
-                           mininterval=10.0,  # Update at most every 10 seconds
-                           miniters=1000)     # Update after at least 1000 iterations
-        
-        for batch_idx, batch in enumerate(progress_bar):
-            # Move batch to device
-            batch = move_batch_to_device(batch, device)
-            
-            # Forward pass
-            outputs = model(batch)
-            predictions = outputs['predictions']
-            targets = batch['purchased']['package_ids']
-            
-            # Get event type flags
-            is_purchase = batch.get('is_purchase', torch.zeros_like(targets, dtype=torch.bool))
-            has_checkout = batch.get('has_checkout', torch.zeros_like(targets, dtype=torch.bool))
-            has_add_to_cart = batch.get('has_add_to_cart', torch.zeros_like(targets, dtype=torch.bool))
-            
-            # Calculate comprehensive metrics
-            batch_metrics = EnhancedEventMetrics.calculate_metrics(
-                predictions, targets, is_purchase, has_checkout, has_add_to_cart, k_values
-            )
-            
-            # Accumulate counts
-            batch_size = len(targets)
-            event_type_counts['total'] += batch_size
-            event_type_counts['purchase'] += batch_metrics.get('purchase_count', 0)
-            event_type_counts['checkout'] += batch_metrics.get('checkout_count', 0)
-            event_type_counts['add_to_cart'] += batch_metrics.get('add_to_cart_count', 0)
-            event_type_counts['intent'] += batch_metrics.get('intent_count', 0)  # Purchase + Checkout
-            
-            # Accumulate metrics - weighted by count
-            for k in k_values:
-                # Overall recall
-                metrics_acc[f'recall@{k}'] += batch_metrics['recall@k'][k] * batch_size
-                
-                # Event-specific recall
-                if 'purchase_count' in batch_metrics and batch_metrics['purchase_count'] > 0:
-                    metrics_acc[f'purchase_recall@{k}'] += batch_metrics['purchase_recall@k'][k] * batch_metrics['purchase_count']
-                
-                if 'checkout_count' in batch_metrics and batch_metrics['checkout_count'] > 0:
-                    metrics_acc[f'checkout_recall@{k}'] += batch_metrics['checkout_recall@k'][k] * batch_metrics['checkout_count']
-                
-                if 'add_to_cart_count' in batch_metrics and batch_metrics['add_to_cart_count'] > 0:
-                    metrics_acc[f'add_to_cart_recall@{k}'] += batch_metrics['add_to_cart_recall@k'][k] * batch_metrics['add_to_cart_count']
-                
-                if 'intent_count' in batch_metrics and batch_metrics['intent_count'] > 0:
-                    metrics_acc[f'intent_recall@{k}'] += batch_metrics['intent_recall@k'][k] * batch_metrics['intent_count']
-            
-            # MRR metrics
-            metrics_acc['overall_mrr'] += batch_metrics['overall_mrr'] * batch_size
-            
-            if 'purchase_count' in batch_metrics and batch_metrics['purchase_count'] > 0:
-                metrics_acc['purchase_mrr'] += batch_metrics['purchase_mrr'] * batch_metrics['purchase_count']
-            
-            if 'checkout_count' in batch_metrics and batch_metrics['checkout_count'] > 0:
-                metrics_acc['checkout_mrr'] += batch_metrics['checkout_mrr'] * batch_metrics['checkout_count']
-            
-            if 'add_to_cart_count' in batch_metrics and batch_metrics['add_to_cart_count'] > 0:
-                metrics_acc['add_to_cart_mrr'] += batch_metrics['add_to_cart_mrr'] * batch_metrics['add_to_cart_count']
-            
-            if 'intent_count' in batch_metrics and batch_metrics['intent_count'] > 0:
-                metrics_acc['intent_mrr'] += batch_metrics['intent_mrr'] * batch_metrics['intent_count']
-            
-            # Periodic memory cleanup for MPS
-            if is_mps and (batch_idx + 1) % 10 == 0:
-                torch.mps.empty_cache()
-                
-                # Show memory usage in progress bar if available
-                if hasattr(torch.mps, 'current_allocated_memory'):
-                    mem_mb = torch.mps.current_allocated_memory() / (1024 * 1024)
-                    progress_bar.set_postfix({'memory_mb': f"{mem_mb:.0f}"})
-    
-    # Final cleanup for MPS
-    if is_mps:
-        torch.mps.empty_cache()
-    
-    # Normalize accumulated metrics
-    metrics = {}
-    
-    # Recall@k metrics
-    metrics['recall@k'] = {}
-    for k in k_values:
-        metrics['recall@k'][k] = metrics_acc[f'recall@{k}'] / event_type_counts['total']
-    
-    # Purchase recall@k
-    if event_type_counts['purchase'] > 0:
-        metrics['purchase_recall@k'] = {}
-        for k in k_values:
-            metrics['purchase_recall@k'][k] = metrics_acc[f'purchase_recall@{k}'] / event_type_counts['purchase']
-    
-    # Checkout recall@k
-    if event_type_counts['checkout'] > 0:
-        metrics['checkout_recall@k'] = {}
-        for k in k_values:
-            metrics['checkout_recall@k'][k] = metrics_acc[f'checkout_recall@{k}'] / event_type_counts['checkout']
-    
-    # Add-to-cart recall@k
-    if event_type_counts['add_to_cart'] > 0:
-        metrics['add_to_cart_recall@k'] = {}
-        for k in k_values:
-            metrics['add_to_cart_recall@k'][k] = metrics_acc[f'add_to_cart_recall@{k}'] / event_type_counts['add_to_cart']
-    
-    # Intent (purchase + checkout) recall@k
-    if event_type_counts['intent'] > 0:
-        metrics['intent_recall@k'] = {}
-        for k in k_values:
-            metrics['intent_recall@k'][k] = metrics_acc[f'intent_recall@{k}'] / event_type_counts['intent']
-    
-    # MRR metrics
-    metrics['overall_mrr'] = metrics_acc['overall_mrr'] / event_type_counts['total']
-    
-    if event_type_counts['purchase'] > 0:
-        metrics['purchase_mrr'] = metrics_acc['purchase_mrr'] / event_type_counts['purchase']
-    
-    if event_type_counts['checkout'] > 0:
-        metrics['checkout_mrr'] = metrics_acc['checkout_mrr'] / event_type_counts['checkout']
-    
-    if event_type_counts['add_to_cart'] > 0:
-        metrics['add_to_cart_mrr'] = metrics_acc['add_to_cart_mrr'] / event_type_counts['add_to_cart']
-    
-    if event_type_counts['intent'] > 0:
-        metrics['intent_mrr'] = metrics_acc['intent_mrr'] / event_type_counts['intent']
-    
-    # Add counts
-    metrics.update(event_type_counts)
-    
-    return metrics
-
-
-class ContrastiveAwareDataset(TravelPackageDataset):
+class ContrastiveAwareDataset(torch.utils.data.Dataset):
     """
     Extended dataset that handles different event types for contrastive learning
     This dataset adds event type flags to model input
     """
     
+    def __init__(self, samples, package_processor, user_to_idx, package_to_idx, event_to_idx,
+                max_short_term=10, max_long_term=20, use_cache=True, prefetch_features=True):
+        """Initialize the dataset with contrastive learning support"""
+        from utils.package_processor import TravelPackageDataset
+        
+        # Create base dataset
+        self.base_dataset = TravelPackageDataset(
+            samples, package_processor, user_to_idx, package_to_idx, event_to_idx,
+            max_short_term, max_long_term, use_cache, prefetch_features
+        )
+        
+        # Keep reference to samples for event flags
+        self.samples = samples
+    
+    def __len__(self):
+        """Return the length of the dataset"""
+        return len(self.base_dataset)
+    
     def __getitem__(self, idx):
         """Enhanced getitem that passes event type flags to the model"""
         # Get base sample
-        sample = super().__getitem__(idx)
+        sample = self.base_dataset[idx]
         
         # Add event type flags
         sample['is_purchase'] = self.samples[idx].get('is_purchase', False)
@@ -739,8 +88,8 @@ class ContrastiveAwareDataset(TravelPackageDataset):
         return sample
 
 
-def create_dataloaders(train_samples, test_samples, package_processor, session_processor, 
-                      batch_size=32, num_workers=0, use_weighted_sampling=True):
+def create_contrastive_dataloaders(train_samples, test_samples, package_processor, session_processor, 
+                                  batch_size=32, num_workers=0, use_weighted_sampling=True):
     """Create optimized dataloaders for training and testing with contrastive awareness"""
     
     # Get mappings
@@ -778,8 +127,6 @@ def create_dataloaders(train_samples, test_samples, package_processor, session_p
     # Create weighted sampler for training if requested
     sampler = None
     if use_weighted_sampling:
-        from torch.utils.data import WeightedRandomSampler
-        
         # Calculate event type counts
         purchase_count = sum(1 for s in train_samples if s.get('is_purchase', False))
         checkout_count = sum(1 for s in train_samples if not s.get('is_purchase', False) 
@@ -852,35 +199,163 @@ def create_dataloaders(train_samples, test_samples, package_processor, session_p
     return train_loader, test_loader
 
 
-def set_performance_mode(mode="balanced"):
-    """Configure training parameters based on performance mode with contrastive learning parameters"""
+def evaluate_with_enhanced_metrics(model, test_loader, device, k_values=[5, 10, 20]):
+    """Evaluate model with enhanced contrastive-specific metrics for different event types"""
+    model.eval()
+    
+    # Initialize metrics accumulator
+    metrics_acc = defaultdict(float)
+    event_type_counts = defaultdict(int)
+    
+    # MPS-specific optimization
+    is_mps = device.type == 'mps'
+    
+    with torch.no_grad():
+        # Handle MPS garbage collection
+        if is_mps:
+            clear_memory(device)
+        
+        # Use smaller batches for evaluation on MPS to avoid OOM
+        progress_bar = tqdm(test_loader, desc="Evaluating",
+                           mininterval=10.0,  # Update at most every 10 seconds
+                           miniters=1000)     # Update after at least 1000 iterations
+        
+        for batch_idx, batch in enumerate(progress_bar):
+            # Move batch to device
+            batch = move_batch_to_device(batch, device)
+            
+            # Forward pass
+            outputs = model(batch)
+            predictions = outputs['predictions']
+            targets = batch['purchased']['package_ids']
+            
+            # Get event type flags
+            is_purchase = batch.get('is_purchase', torch.zeros_like(targets, dtype=torch.bool))
+            has_checkout = batch.get('has_checkout', torch.zeros_like(targets, dtype=torch.bool))
+            has_add_to_cart = batch.get('has_add_to_cart', torch.zeros_like(targets, dtype=torch.bool))
+            
+            # Calculate comprehensive metrics using the EnhancedEventMetrics specialized implementation
+            batch_metrics = EnhancedEventMetrics.calculate_metrics(
+                predictions, targets, is_purchase, has_checkout, has_add_to_cart, k_values
+            )
+            
+            # Accumulate counts
+            batch_size = len(targets)
+            event_type_counts['total'] += batch_size
+            event_type_counts['purchase'] += batch_metrics.get('purchase_count', 0)
+            event_type_counts['checkout'] += batch_metrics.get('checkout_count', 0)
+            event_type_counts['add_to_cart'] += batch_metrics.get('add_to_cart_count', 0)
+            event_type_counts['intent'] += batch_metrics.get('intent_count', 0)  # Purchase + Checkout
+            
+            # Accumulate metrics - weighted by count
+            for k in k_values:
+                # Overall recall
+                metrics_acc[f'recall@{k}'] += batch_metrics['recall@k'][k] * batch_size
+                
+                # Event-specific recall
+                if 'purchase_count' in batch_metrics and batch_metrics['purchase_count'] > 0:
+                    metrics_acc[f'purchase_recall@{k}'] += batch_metrics['purchase_recall@k'][k] * batch_metrics['purchase_count']
+                
+                if 'checkout_count' in batch_metrics and batch_metrics['checkout_count'] > 0:
+                    metrics_acc[f'checkout_recall@{k}'] += batch_metrics['checkout_recall@k'][k] * batch_metrics['checkout_count']
+                
+                if 'add_to_cart_count' in batch_metrics and batch_metrics['add_to_cart_count'] > 0:
+                    metrics_acc[f'add_to_cart_recall@{k}'] += batch_metrics['add_to_cart_recall@k'][k] * batch_metrics['add_to_cart_count']
+                
+                if 'intent_count' in batch_metrics and batch_metrics['intent_count'] > 0:
+                    metrics_acc[f'intent_recall@{k}'] += batch_metrics['intent_recall@k'][k] * batch_metrics['intent_count']
+            
+            # MRR metrics
+            metrics_acc['overall_mrr'] += batch_metrics['overall_mrr'] * batch_size
+            
+            if 'purchase_count' in batch_metrics and batch_metrics['purchase_count'] > 0:
+                metrics_acc['purchase_mrr'] += batch_metrics['purchase_mrr'] * batch_metrics['purchase_count']
+            
+            if 'checkout_count' in batch_metrics and batch_metrics['checkout_count'] > 0:
+                metrics_acc['checkout_mrr'] += batch_metrics['checkout_mrr'] * batch_metrics['checkout_count']
+            
+            if 'add_to_cart_count' in batch_metrics and batch_metrics['add_to_cart_count'] > 0:
+                metrics_acc['add_to_cart_mrr'] += batch_metrics['add_to_cart_mrr'] * batch_metrics['add_to_cart_count']
+            
+            if 'intent_count' in batch_metrics and batch_metrics['intent_count'] > 0:
+                metrics_acc['intent_mrr'] += batch_metrics['intent_mrr'] * batch_metrics['intent_count']
+            
+            # Periodic memory cleanup for MPS
+            if is_mps and (batch_idx + 1) % 10 == 0:
+                clear_memory(device)
+                
+                # Show memory usage in progress bar if available
+                if hasattr(torch.mps, 'current_allocated_memory'):
+                    mem_mb = torch.mps.current_allocated_memory() / (1024 * 1024)
+                    progress_bar.set_postfix({'memory_mb': f"{mem_mb:.0f}"})
+    
+    # Final cleanup for MPS
+    if is_mps:
+        clear_memory(device)
+    
+    # Normalize accumulated metrics
+    metrics = {}
+    
+    # Recall@k metrics
+    metrics['recall@k'] = {}
+    for k in k_values:
+        metrics['recall@k'][k] = metrics_acc[f'recall@{k}'] / event_type_counts['total']
+    
+    # Purchase recall@k
+    if event_type_counts['purchase'] > 0:
+        metrics['purchase_recall@k'] = {}
+        for k in k_values:
+            metrics['purchase_recall@k'][k] = metrics_acc[f'purchase_recall@{k}'] / event_type_counts['purchase']
+    
+    # Checkout recall@k
+    if event_type_counts['checkout'] > 0:
+        metrics['checkout_recall@k'] = {}
+        for k in k_values:
+            metrics['checkout_recall@k'][k] = metrics_acc[f'checkout_recall@{k}'] / event_type_counts['checkout']
+    
+    # Add-to-cart recall@k
+    if event_type_counts['add_to_cart'] > 0:
+        metrics['add_to_cart_recall@k'] = {}
+        for k in k_values:
+            metrics['add_to_cart_recall@k'][k] = metrics_acc[f'add_to_cart_recall@{k}'] / event_type_counts['add_to_cart']
+    
+    # Intent (purchase + checkout) recall@k
+    if event_type_counts['intent'] > 0:
+        metrics['intent_recall@k'] = {}
+        for k in k_values:
+            metrics['intent_recall@k'][k] = metrics_acc[f'intent_recall@{k}'] / event_type_counts['intent']
+    
+    # MRR metrics
+    metrics['overall_mrr'] = metrics_acc['overall_mrr'] / event_type_counts['total']
+    
+    if event_type_counts['purchase'] > 0:
+        metrics['purchase_mrr'] = metrics_acc['purchase_mrr'] / event_type_counts['purchase']
+    
+    if event_type_counts['checkout'] > 0:
+        metrics['checkout_mrr'] = metrics_acc['checkout_mrr'] / event_type_counts['checkout']
+    
+    if event_type_counts['add_to_cart'] > 0:
+        metrics['add_to_cart_mrr'] = metrics_acc['add_to_cart_mrr'] / event_type_counts['add_to_cart']
+    
+    if event_type_counts['intent'] > 0:
+        metrics['intent_mrr'] = metrics_acc['intent_mrr'] / event_type_counts['intent']
+    
+    # Add counts
+    metrics.update(event_type_counts)
+    
+    return metrics
+
+
+def get_contrastive_config(mode="balanced"):
+    """Get contrastive learning specific parameters based on performance mode"""
     config = {}
     
     # Special mode for Apple Silicon (M1/M2/M3)
-    is_mps = torch.backends.mps.is_available()
+    is_mps = torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
     
     if mode == "apple_silicon" or (mode == "balanced" and is_mps):
-        # Specific optimizations for Apple Silicon
+        # Contrastive margin parameters optimized for Apple Silicon
         config.update({
-            # Batch size settings
-            "batch_size": 256,                   # Increased batch size for Apple Silicon (was using multiplier 1.5)
-            "embedding_dim": 256,                # Increased from 192 for better representation
-            "hidden_dim": 256,                   # Increased from 192 for better model capacity
-            "accumulation_steps": 2,             # Reduced from 4 for faster updates
-            "use_amp": False,                    # MPS doesn't support AMP yet
-            "compile_model": False,              # Don't attempt to compile for MPS
-            "dropout": 0.25,                     # Increased from 0.2 for better regularization
-            "patience": 10,                      # Increased to 10 to allow more epochs without improvement
-            "prefetch_factor": 2,                # Less prefetching for MPS (tends to use more CPU memory)
-            "max_package_count": 50000,          # Increased from 30000 for better coverage
-            "use_reduced_embeddings": True,      # Definitely use reduced embeddings for memory efficiency
-            "learning_rate": 0.001,              # Reduced to 0.001 for more stable training
-            "mps_clear_cache_frequency": 5,      # Clear MPS cache every N batches
-            "use_half_precision_embeddings": True, # Use float16 for embeddings on MPS
-            "reduce_memory_usage": True,         # Enable additional memory optimizations
-            "num_workers": 0,                    # No workers for MPS (avoid multiprocessing errors)
-            "epochs": 30,                        # Number of epochs
-            
             # Contrastive margin parameters
             "temperature": 0.1,                  # Contrastive temperature - lower = sharper distinctions
             "purchase_margin": 0.0,              # No margin for purchases (strongest signal)
@@ -890,23 +365,8 @@ def set_performance_mode(mode="balanced"):
             "hard_negative_ratio": 0.7           # Proportion of hard negatives to keep
         })
     elif mode == "fastest":
-        # Prioritize speed over accuracy
+        # Contrastive margin parameters - less aggressive for faster convergence
         config.update({
-            "batch_size": 320,                   # Larger batches (was using multiplier 2.0)
-            "embedding_dim": 128,                # Smaller embeddings
-            "hidden_dim": 128,                   # Smaller hidden dims
-            "accumulation_steps": 4,             # More gradient accumulation
-            "use_amp": not is_mps,               # Use AMP if not on MPS
-            "compile_model": not is_mps,         # Compile if not on MPS
-            "dropout": 0.1,                      # Less regularization
-            "patience": 2,                       # Less patience for early stopping
-            "prefetch_factor": 4,                # More prefetching
-            "max_package_count": 10000,          # Limit package vocabulary
-            "use_reduced_embeddings": True,      # Use reduced embeddings (768 dim)
-            "learning_rate": 0.002,              # Higher learning rate
-            "epochs": 15,                        # Fewer epochs
-            
-            # Contrastive margin parameters - less aggressive for faster convergence
             "temperature": 0.2,                  # Higher temperature = smoother distinctions
             "purchase_margin": 0.0,              # No margin for purchases
             "checkout_margin": 0.2,              # Smaller checkout margin for faster convergence
@@ -915,23 +375,8 @@ def set_performance_mode(mode="balanced"):
             "hard_negative_ratio": 0.5           # Fewer hard negatives for faster training
         })
     elif mode == "accurate":
-        # Prioritize accuracy over speed
+        # Contrastive margin parameters - more aggressive for better accuracy
         config.update({
-            "batch_size": 128 if not is_mps else 192,              # Smaller batches (was using multiplier 0.5/0.75)
-            "embedding_dim": 512 if not is_mps else 384,          # Larger embeddings (adjusted for MPS)
-            "hidden_dim": 384 if not is_mps else 320,             # Larger hidden dims (adjusted for MPS)
-            "accumulation_steps": 1 if not is_mps else 2,         # No/less gradient accumulation
-            "use_amp": False,                                      # No mixed precision
-            "compile_model": False,                                # No model compilation
-            "dropout": 0.3,                                        # More regularization 
-            "patience": 5,                                         # More patience for early stopping
-            "prefetch_factor": 2,                                  # Less prefetching
-            "max_package_count": None,                             # No package limit
-            "use_reduced_embeddings": False if not is_mps else True, # Use full embeddings if not on MPS
-            "learning_rate": 0.0005,                               # Lower learning rate
-            "epochs": 40,                                          # More epochs
-            
-            # Contrastive margin parameters - more aggressive for better accuracy
             "temperature": 0.05,                 # Lower temperature = sharper distinctions
             "purchase_margin": 0.0,              # No margin for purchases
             "checkout_margin": 0.25,             # Precise checkout margin
@@ -940,23 +385,8 @@ def set_performance_mode(mode="balanced"):
             "hard_negative_ratio": 0.8           # More hard negatives for better discrimination
         })
     else:  # "balanced" mode (non-MPS)
-        # Balance between speed and accuracy for non-MPS devices
+        # Contrastive margin parameters - balanced configuration
         config.update({
-            "batch_size": 192,                   # Increased batch size (was using multiplier 1.0)
-            "embedding_dim": 256,                # Medium embeddings
-            "hidden_dim": 256,                   # Medium hidden dims
-            "accumulation_steps": 2,             # Some gradient accumulation
-            "use_amp": not is_mps,               # Use mixed precision if not MPS
-            "compile_model": not is_mps,         # Compile model if not MPS
-            "dropout": 0.2,                      # Medium regularization
-            "patience": 3,                       # Medium patience
-            "prefetch_factor": 3,                # Medium prefetching
-            "max_package_count": 50000,          # Some package limit
-            "use_reduced_embeddings": True,      # Use reduced embeddings
-            "learning_rate": 0.001,              # Standard learning rate
-            "epochs": 30,                        # Standard epochs
-            
-            # Contrastive margin parameters - balanced configuration
             "temperature": 0.1,                  # Balanced temperature
             "purchase_margin": 0.0,              # No margin for purchases
             "checkout_margin": 0.3,              # Standard checkout margin
@@ -964,15 +394,6 @@ def set_performance_mode(mode="balanced"):
             "view_margin": 1.0,                  # Standard view margin
             "hard_negative_ratio": 0.7           # Standard hard negative ratio
         })
-    
-    # Print detailed configuration
-    mode_display = mode
-    if mode == "balanced" and is_mps:
-        mode_display = "APPLE_SILICON (auto)"
-    print(f"\nUsing {mode_display.upper()} performance mode")
-    
-    if is_mps:
-        print("Apple Silicon optimizations active")
     
     return config
 
@@ -985,7 +406,7 @@ def main(performance_config=None):
     elif torch.backends.mps.is_available():
         device = torch.device('mps')
         # MPS-specific optimizations
-        torch.mps.empty_cache()
+        clear_memory(device)
         print("Apple MPS device detected - applying Metal-specific optimizations")
     else:
         device = torch.device('cpu')
@@ -1005,6 +426,12 @@ def main(performance_config=None):
     # Use default performance config if none provided
     if performance_config is None:
         performance_config = set_performance_mode("balanced")
+    
+    # Add contrastive specific parameters
+    contrastive_config = get_contrastive_config(
+        "apple_silicon" if device.type == "mps" else performance_config.get("mode", "balanced")
+    )
+    performance_config.update(contrastive_config)
     
     # Data paths
     package_data_path = "data/feed.parquet"
@@ -1085,9 +512,13 @@ def main(performance_config=None):
     print("\n5. Preparing training samples...")
     samples = session_processor.prepare_enhanced_training_data()
     
+    # Limit samples for testing if needed
+    samples = limit_samples_for_testing(samples)
+    
     # Enhance samples with event type identification
     print("\n6. Enhancing samples with event types...")
-    enhanced_samples = identify_event_types(samples, session_processor)
+    event_to_idx = session_processor.get_idx_mappings()['event_to_idx']
+    enhanced_samples = identify_event_types(samples, event_to_idx)
     
     print("\n7. Applying data filters...")
     
@@ -1116,54 +547,17 @@ def main(performance_config=None):
     train_samples, test_samples = time_based_split_year(filtered_samples, train_ratio=0.93)
     
     # Ensure evaluation set has enough events of each type for meaningful metrics
-    purchase_samples = [s for s in test_samples if s.get('is_purchase', False)]
-    checkout_samples = [s for s in test_samples if not s.get('is_purchase', False) and s.get('has_checkout', False)]
-    add_to_cart_samples = [s for s in test_samples if not s.get('is_purchase', False) 
-                          and not s.get('has_checkout', False) and s.get('has_add_to_cart', False)]
-    
-    # Ensure enough purchases in test set
-    if len(purchase_samples) < 50:
-        print(f"Warning: Only {len(purchase_samples)} purchases in test set, adding more...")
-        # Find more purchases from train samples
-        extra_purchases = [s for s in train_samples if s.get('is_purchase', False)][:50-len(purchase_samples)]
-        test_samples.extend(extra_purchases)
-        # Remove these from train samples
-        train_samples = [s for s in train_samples if s not in extra_purchases]
-        print(f"Added {len(extra_purchases)} more purchase samples to test set")
-    
-    # Ensure enough checkouts in test set
-    if len(checkout_samples) < 50:
-        print(f"Warning: Only {len(checkout_samples)} checkout events in test set, adding more...")
-        # Find more checkout samples from train samples
-        extra_checkouts = [
-            s for s in train_samples if 
-            (not s.get('is_purchase', False) and s.get('has_checkout', False))
-        ][:50-len(checkout_samples)]
-        test_samples.extend(extra_checkouts)
-        # Remove these from train samples
-        train_samples = [s for s in train_samples if s not in extra_checkouts]
-        print(f"Added {len(extra_checkouts)} more checkout samples to test set")
-    
-    # Ensure enough add-to-cart in test set
-    if len(add_to_cart_samples) < 50:
-        print(f"Warning: Only {len(add_to_cart_samples)} add-to-cart events in test set, adding more...")
-        # Find more add-to-cart samples from train samples
-        extra_carts = [
-            s for s in train_samples if 
-            (not s.get('is_purchase', False) and not s.get('has_checkout', False) and s.get('has_add_to_cart', False))
-        ][:50-len(add_to_cart_samples)]
-        test_samples.extend(extra_carts)
-        # Remove these from train samples
-        train_samples = [s for s in train_samples if s not in extra_carts]
-        print(f"Added {len(extra_carts)} more add-to-cart samples to test set")
+    train_samples, test_samples = ensure_balanced_test_set(
+        train_samples, test_samples, min_purchases=50
+    )
     
     # Analyze distributions
     analyze_data_distribution(train_samples, "Train")
     analyze_data_distribution(test_samples, "Test")
     
-    # Create datasets and dataloaders
+    # Create datasets and dataloaders with contrastive-specific dataset
     print("\n8. Creating dataloaders...")
-    train_loader, test_loader = create_dataloaders(
+    train_loader, test_loader = create_contrastive_dataloaders(
         train_samples, test_samples, package_processor, session_processor,
         batch_size=batch_size, num_workers=num_workers, use_weighted_sampling=True
     )
@@ -1294,13 +688,13 @@ def main(performance_config=None):
         )
         train_time = time.time() - start_time
         
-        # Evaluate
+        # Evaluate with our specialized evaluation function
         start_time = time.time()
-        test_metrics = evaluate(model, test_loader, device, k_values=[5, 10, 20])
+        test_metrics = evaluate_with_enhanced_metrics(model, test_loader, device, k_values=[5, 10, 20])
         eval_time = time.time() - start_time
         
         # Calculate combined recall metric (purchase + checkout + add-to-cart), weighed by importance
-        # Purchase gets full weight, checkout gets 0.7 weight, add-to-cart gets 0.3 weight
+        # Purchase gets full weight, checkout gets 0.6 weight, add-to-cart gets 0.2 weight
         purchase_recall = test_metrics.get('purchase_recall@k', {}).get(10, 0)
         checkout_recall = test_metrics.get('checkout_recall@k', {}).get(10, 0)
         cart_recall = test_metrics.get('add_to_cart_recall@k', {}).get(10, 0)
@@ -1314,8 +708,8 @@ def main(performance_config=None):
         # Weighted average based on relative importance and count
         if total_important > 0:
             purchase_weight = 1.0
-            checkout_weight = 0.7
-            cart_weight = 0.3
+            checkout_weight = 0.6
+            cart_weight = 0.2
             
             purchase_contribution = purchase_recall * purchase_weight * purchase_count
             checkout_contribution = checkout_recall * checkout_weight * checkout_count
@@ -1473,6 +867,7 @@ if __name__ == "__main__":
     
     # Set performance configuration
     performance_config = set_performance_mode(args.mode)
+    performance_config["mode"] = args.mode  # Store the mode for contrastive config
     
     # Override with specific command-line arguments if provided
     if args.batch_size is not None:
