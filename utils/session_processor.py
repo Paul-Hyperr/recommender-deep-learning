@@ -21,20 +21,21 @@ class SessionProcessor:
     - Creating training samples with both purchase and non-purchase data
     - Incorporating more sessions for richer user profiles
     """
-    def __init__(self, data_path=None, session_timeout_hours=24, min_interactions=5, 
+    def __init__(self, event_data_path=None, session_timeout_hours=12, min_interactions=10, 
                  cache_dir='data/cache', max_sessions_per_user=20, max_samples_per_user=10):
         """
         Initialize SessionProcessor
         
         Args:
-            data_path (str): Path to the event data file
+            event_data_path (str): Path to the event data file (e.g., 'bookit_events_13_months.parquet' or 'bookit_events_2_months.parquet')
             session_timeout_hours (int): Timeout for defining user sessions
             min_interactions (int): Minimum number of interactions to keep a user
-            cache_dir (str): Directory for caching processed data
+            cache_dir (str): Directory for caching processed data (only sessions.pkl will be cached)
             max_sessions_per_user (int): Maximum number of sessions to consider per user
             max_samples_per_user (int): Maximum number of training samples to create per user
         """
-        self.data_path = data_path
+        self.event_data_path = event_data_path
+        self.data_path = event_data_path  # Keep for backward compatibility
         self.session_timeout_hours = session_timeout_hours
         self.min_interactions = min_interactions
         self.cache_dir = cache_dir
@@ -59,72 +60,53 @@ class SessionProcessor:
         self.sessions = None
         self.filtered_users = None
     
+    def _get_session_cache_filename(self):
+        """
+        Generate a unique cache filename based on the event data file
+        """
+        if self.event_data_path:
+            # Extract just the filename without path and extension
+            base_name = os.path.splitext(os.path.basename(self.event_data_path))[0]
+            return f'sessions_{base_name}.pkl'
+        return 'sessions.pkl'  # Default fallback
+    
     def clear_cache(self):
         """
-        Clear all cached files in the cache directory
-        
-        Helps prevent using stale or incorrect cached data
+        Clear only sessions cache file
         """
         try:
-            # Remove cache files
-            cache_files = [
-                os.path.join(self.cache_dir, 'preprocessed_data.pkl'),
-                os.path.join(self.cache_dir, 'sessions.pkl'),
-                os.path.join(self.cache_dir, 'user_package_mappings.pkl'),
-                os.path.join(self.cache_dir, 'training_samples.pkl'),
-                os.path.join(self.cache_dir, 'enhanced_training_samples.pkl')
-            ]
+            # Get the specific cache file for this dataset
+            cache_file = os.path.join(self.cache_dir, self._get_session_cache_filename())
             
-            for file in cache_files:
-                if os.path.exists(file):
-                    os.remove(file)
-                    print(f"Removed cache file: {file}")
-            
-            print(f"Cleared session processing cache")
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
+                print(f"Removed sessions cache file: {cache_file}")
+            else:
+                print(f"No sessions cache to clear: {cache_file}")
         except Exception as e:
             print(f"Error clearing cache: {e}")
     
-    def load_data(self, use_cache=True):
+    def load_data(self, event_data_path=None):
         """
-        Load event data with caching for efficiency
+        Load event data directly without caching
         
         Args:
-            use_cache (bool): Whether to use cached data if available
+            event_data_path (str): Optional path to event data file. If not provided, uses instance event_data_path
         """
-        cache_file = os.path.join(self.cache_dir, 'preprocessed_data.pkl')
-        
-        # Check existing cache and clear if data path has changed
-        if use_cache and os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'rb') as f:
-                    cache_data = pickle.load(f)
-                    cached_data_path = cache_data.get('data_path')
-                    
-                    # If data path has changed, clear the cache
-                    if cached_data_path != self.data_path:
-                        print(f"Dataset path changed. Clearing previous cache.")
-                        self.clear_cache()
-                        # Fall through to load new data
-                    else:
-                        # Load cached data if path matches
-                        self.df = cache_data['df']
-                        self.filtered_users = cache_data.get('filtered_users')
-                        
-                        print(f"Loaded {len(self.df)} events from cache")
-                        return
-            except (pickle.UnpicklingError, KeyError, EOFError) as e:
-                print(f"Cache loading error: {e}. Clearing cache and reloading.")
-                self.clear_cache()
-        
+        # Allow overriding the event data path
+        if event_data_path:
+            self.event_data_path = event_data_path
+            self.data_path = event_data_path  # Backward compatibility
+            
         # Load data from source
-        if self.data_path:
-            print(f"Loading event data from {self.data_path}")
+        if self.event_data_path:
+            print(f"Loading event data from {self.event_data_path}")
             
             # Check file extension
-            if self.data_path.endswith('.parquet'):
+            if self.event_data_path.endswith('.parquet'):
                 # Load parquet file
                 try:
-                    self.df = pd.read_parquet(self.data_path)
+                    self.df = pd.read_parquet(self.event_data_path)
                     
                     # Convert timestamp to datetime if needed
                     if 'created_at' in self.df.columns:
@@ -136,7 +118,7 @@ class SessionProcessor:
                     return
             else:
                 # Use chunking to process large CSV datasets
-                chunks = pd.read_csv(self.data_path, chunksize=1000000)
+                chunks = pd.read_csv(self.event_data_path, chunksize=1000000)
                 
                 # Process chunks
                 dfs = []
@@ -159,17 +141,9 @@ class SessionProcessor:
             # Filter users based on interaction count
             self._filter_users()
             
-            # Save to cache
-            cache_data = {
-                'df': self.df,
-                'filtered_users': self.filtered_users,
-                'data_path': self.data_path  # Store the current data path
-            }
-            
-            with open(cache_file, 'wb') as f:
-                pickle.dump(cache_data, f)
-            
-            print(f"Saved processed data to cache: {cache_file}")
+            print(f"Data loading complete. Loaded {len(self.df)} events after filtering.")
+        else:
+            print("Error: No event data path provided")
     
     def _filter_users(self):
         """Filter users based on minimum interaction count and remove outlier sessions"""
@@ -177,55 +151,37 @@ class SessionProcessor:
         user_interaction_counts = self.df['userId'].value_counts()
         
         # Get users with at least min_interactions
-        self.filtered_users = user_interaction_counts[user_interaction_counts >= self.min_interactions].index.tolist()
+        users_with_enough_interactions = user_interaction_counts[user_interaction_counts >= self.min_interactions].index.tolist()
+        
+        # IMPORTANT: Also keep ALL users who have made purchases, regardless of interaction count
+        users_with_purchases = self.df[self.df['event'] == 'Purchase']['userId'].unique().tolist()
+        
+        # Combine both sets of users
+        self.filtered_users = list(set(users_with_enough_interactions + users_with_purchases))
         
         # Filter dataframe
         self.df = self.df[self.df['userId'].isin(self.filtered_users)]
         
-        print(f"Filtered to {len(self.filtered_users)} users with at least {self.min_interactions} interactions")
-        print(f"Remaining events: {len(self.df)}")
+        print(f"\nFiltered to {len(self.filtered_users)} users:")
+        print(f"  - {len(users_with_enough_interactions)} users with at least {self.min_interactions} interactions")
+        print(f"  - {len(users_with_purchases)} users with purchases total")
     
-    def create_mappings(self, use_cache=True):
+    def create_mappings(self):
         """Create mappings from user and package IDs to indices"""
-        cache_file = os.path.join(self.cache_dir, 'user_package_mappings.pkl')
-        
-        if use_cache and os.path.exists(cache_file):
-            print(f"Loading user and package mappings from cache")
-            with open(cache_file, 'rb') as f:
-                mappings = pickle.load(f)
-                self.user_to_idx = mappings['user_to_idx']
-                self.package_to_idx = mappings['package_to_idx']
-                # Also load event mappings if available
-                if 'event_to_idx' in mappings:
-                    self.event_to_idx = mappings['event_to_idx']
-            
-            # Print mapping statistics
-            print(f"Loaded mappings for {len(self.user_to_idx)} users and {len(self.package_to_idx)} packages")
-            return
-        
         print("Creating user and package mappings...")
         
-        # Create user mapping
+        if self.df is None:
+            self.load_data()
+        
+        # Create user mapping (start from 1 to reserve 0 for padding)
         users = self.df['userId'].unique()
-        self.user_to_idx = {user: i for i, user in enumerate(users)}
+        self.user_to_idx = {user: i+1 for i, user in enumerate(users)}
         
         # Create package mapping
         packages = self.df['main_id'].unique()
         self.package_to_idx = {package: i+1 for i, package in enumerate(packages)}  # Reserve 0 for padding
         
         print(f"Created mappings for {len(self.user_to_idx)} users and {len(self.package_to_idx)} packages")
-        
-        # Save mappings to cache
-        mappings = {
-            'user_to_idx': self.user_to_idx,
-            'package_to_idx': self.package_to_idx,
-            'event_to_idx': self.event_to_idx
-        }
-        
-        with open(cache_file, 'wb') as f:
-            pickle.dump(mappings, f)
-        
-        print(f"Saved mappings to cache: {cache_file}")
     
     def _process_user_group(self, user_group_data):
         """
@@ -294,8 +250,8 @@ class SessionProcessor:
         Returns:
             list: Extracted sessions
         """
-        # Cache file path
-        cache_file = os.path.join(self.cache_dir, 'sessions.pkl')
+        # Generate dataset-specific cache file path
+        cache_file = os.path.join(self.cache_dir, self._get_session_cache_filename())
 
         # Check cache
         if use_cache and os.path.exists(cache_file):
@@ -304,7 +260,7 @@ class SessionProcessor:
                     loaded_sessions = pickle.load(f)
                 
                     if loaded_sessions and isinstance(loaded_sessions, list):
-                        print(f"Loaded {len(loaded_sessions)} sessions from cache")
+                        print(f"Loaded {len(loaded_sessions)} sessions from cache: {os.path.basename(cache_file)}")
                         self.sessions = loaded_sessions
                         return loaded_sessions
             except Exception as e:
@@ -350,19 +306,42 @@ class SessionProcessor:
         print(f"Median session length: {np.median(session_lengths):.2f}")
         print(f"Max session length: {np.max(session_lengths)}")
         
-        # Remove the upper 0.1% sessions by length
-        length_threshold = np.percentile(session_lengths, 99.9)
-        filtered_sessions = [session for session in sessions if len(session['package_ids']) <= length_threshold]
+        # Remove the upper 0.1% sessions by length, BUT preserve all sessions with purchases
+        length_threshold = np.percentile(session_lengths, 99.99)
         
-        removed_count = len(sessions) - len(filtered_sessions)
+        # Count purchases before filtering
+        purchases_before = sum(sum(session['is_purchase']) for session in sessions)
+        
+        # Filter sessions but ALWAYS keep sessions with purchases
+        filtered_sessions = []
+        removed_count = 0
+        removed_with_purchases = 0
+        
+        for session in sessions:
+            session_length = len(session['package_ids'])
+            has_purchase = any(session['is_purchase'])
+            
+            # Keep session if it's below threshold OR has a purchase
+            if session_length <= length_threshold or has_purchase:
+                filtered_sessions.append(session)
+            else:
+                removed_count += 1
+                if has_purchase:
+                    removed_with_purchases += 1
+        
+        # Count purchases after filtering
+        purchases_after = sum(sum(session['is_purchase']) for session in filtered_sessions)
+        
         print(f"Removed {removed_count} sessions ({removed_count/len(sessions)*100:.2f}%) with length > {length_threshold:.0f}")
+        print(f"  - {removed_with_purchases} of removed sessions had purchases (these were preserved)")
         print(f"Remaining sessions: {len(filtered_sessions)}")
+        print(f"Purchase events: {purchases_before} -> {purchases_after} (preserved {purchases_after/purchases_before*100:.1f}%)")
         
         # Save to cache
         try:
             with open(cache_file, 'wb') as f:
                 pickle.dump(filtered_sessions, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"Sessions saved to cache: {cache_file}")
+            print(f"Sessions saved to cache: {os.path.basename(cache_file)}")
         except Exception as e:
             print(f"Error saving sessions to cache: {e}")
         
@@ -371,7 +350,7 @@ class SessionProcessor:
         
         return filtered_sessions
     
-    def prepare_enhanced_training_data(self, use_cache=True):
+    def prepare_enhanced_training_data(self):
         """
         Prepare enhanced training data from sessions including event types
         
@@ -381,29 +360,12 @@ class SessionProcessor:
         3. Incorporates more historical context
         4. Includes event types for all interactions
         
-        Args:
-            use_cache (bool): Whether to use cached training data
-            
         Returns:
             list: Enhanced training samples
         """
-        cache_file = os.path.join(self.cache_dir, 'enhanced_training_samples.pkl')
-        
-        if use_cache and os.path.exists(cache_file):
-            print(f"Loading enhanced training samples from cache: {cache_file}")
-            with open(cache_file, 'rb') as f:
-                samples = pickle.load(f)
-            
-            # Check if cached samples have event types
-            if samples and 'short_term_events' not in samples[0]:
-                print("Cached samples don't have event types. Regenerating...")
-                use_cache = False
-            else:
-                print(f"Loaded {len(samples)} enhanced training samples from cache")
-                return samples
         
         if not self.sessions:
-            self.extract_sessions(use_cache=use_cache)
+            self.extract_sessions(use_cache=True)  # Sessions still use cache
         
         print("Preparing enhanced training data with event types...")
         
@@ -423,8 +385,23 @@ class SessionProcessor:
             # Sort sessions by time
             sessions.sort(key=lambda x: x['start_time'])
             
-            # Limit to the most recent max_sessions_per_user sessions
-            recent_sessions = sessions[-self.max_sessions_per_user:] if len(sessions) > self.max_sessions_per_user else sessions
+            # Limit sessions but prioritize those with purchases
+            if len(sessions) > self.max_sessions_per_user:
+                # Separate sessions with and without purchases
+                sessions_with_purchases = [s for s in sessions if any(s['is_purchase'])]
+                sessions_without_purchases = [s for s in sessions if not any(s['is_purchase'])]
+                
+                # Take all sessions with purchases (up to limit)
+                recent_sessions = sessions_with_purchases[-self.max_sessions_per_user:]
+                
+                # Fill remaining slots with non-purchase sessions
+                remaining_slots = self.max_sessions_per_user - len(recent_sessions)
+                if remaining_slots > 0:
+                    recent_sessions = sessions_without_purchases[-remaining_slots:] + recent_sessions
+                    # Re-sort by time to maintain chronological order
+                    recent_sessions.sort(key=lambda x: x['start_time'])
+            else:
+                recent_sessions = sessions
             
             # Track all samples created for this user
             user_samples = []
@@ -515,8 +492,18 @@ class SessionProcessor:
             if user_samples:
                 # Sort by timestamp to get the most recent ones
                 user_samples.sort(key=lambda x: x['timestamp'], reverse=True)
-                # Limit samples per user
-                limited_samples = user_samples[:self.max_samples_per_user]
+                
+                # Separate purchase and non-purchase samples
+                purchase_samples_user = [s for s in user_samples if s['is_purchase']]
+                no_purchase_samples_user = [s for s in user_samples if not s['is_purchase']]
+                
+                # Always keep all purchase samples, limit non-purchase samples
+                limited_samples = purchase_samples_user  # Keep ALL purchases
+                
+                # Add non-purchase samples up to the limit
+                remaining_slots = max(0, self.max_samples_per_user - len(purchase_samples_user))
+                limited_samples.extend(no_purchase_samples_user[:remaining_slots])
+                
                 samples.extend(limited_samples)
         
         # Track statistics
@@ -525,11 +512,22 @@ class SessionProcessor:
         empty_short_term = sum(1 for s in samples if not s['short_term_packages'])
         empty_long_term = sum(1 for s in samples if not s['long_term_packages'])
         
-        print(f"Created {len(samples)} enhanced training samples")
+        print(f"\nCreated {len(samples)} enhanced training samples")
         print(f"  - Purchase samples: {purchase_count} ({purchase_count/len(samples)*100:.2f}%)")
         print(f"  - No-purchase samples: {no_purchase_count} ({no_purchase_count/len(samples)*100:.2f}%)")
         print(f"  - Samples with empty short-term: {empty_short_term} ({empty_short_term/len(samples)*100:.2f}%)")
         print(f"  - Samples with empty long-term: {empty_long_term} ({empty_long_term/len(samples)*100:.2f}%)")
+        
+        # Additional debugging for purchase tracking
+        if purchase_count < 1000:  # Alert if suspiciously low
+            print(f"\nWARNING: Only {purchase_count} purchase samples created from sessions!")
+            # Count total purchase events in original sessions
+            total_purchase_events = 0
+            for session in self.sessions:
+                total_purchase_events += sum(session['is_purchase'])
+            print(f"Total purchase events in sessions: {total_purchase_events}")
+            if total_purchase_events > purchase_count:
+                print(f"Lost {total_purchase_events - purchase_count} purchase events during sample creation")
         
         # Count event types in samples
         event_counts = defaultdict(int)
@@ -542,12 +540,6 @@ class SessionProcessor:
         print("\nEvent type distribution in short-term sequences:")
         for event_type, count in sorted(event_counts.items()):
             print(f"  - {event_type}: {count}")
-        
-        # Save samples to cache
-        with open(cache_file, 'wb') as f:
-            pickle.dump(samples, f)
-        
-        print(f"Saved enhanced training samples to cache: {cache_file}")
         
         return samples
     

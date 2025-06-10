@@ -18,4 +18,4 @@ class Config:
     dropout = 0.2
     
     # Evaluation parameters
-    top_k = 10  # For HR@k and MRR@k
+    top_k = 20  # For HR@k and MRR@k

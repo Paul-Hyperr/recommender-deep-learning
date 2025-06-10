@@ -469,3 +469,126 @@ def calculate_quality_score(analysis: dict) -> float:
     # Ensure score stays in range
     return max(0, min(100, score))
 
+
+def clean_stale_caches(cache_dir: str = 'data/cache', dry_run: bool = False) -> dict:
+    """
+    Remove cache files that can become stale when processing logic changes.
+    
+    This function removes caches that store processed data which may become outdated
+    when the processing pipeline is updated (e.g., adding new event flags).
+    
+    Keeps:
+    - LLM embeddings (expensive API calls)
+    - Geocoding data (expensive API calls)
+    - Package metadata/features (relatively stable)
+    
+    Removes:
+    - Dataset caches (dataset_*.pkl)
+    - Enhanced training samples
+    - Sessions cache
+    - Preprocessed data
+    
+    Args:
+        cache_dir: Path to cache directory
+        dry_run: If True, only show what would be deleted without actually deleting
+        
+    Returns:
+        Dictionary with cleanup statistics
+    """
+    import glob
+    
+    # Define patterns for caches to remove
+    stale_patterns = [
+        'dataset_*.pkl',              # Dataset caches with pre-computed tensors
+        'enhanced_training_samples.pkl',  # Processed training samples
+        'sessions.pkl',               # Extracted sessions
+        'preprocessed_data.pkl',      # Preprocessed event data
+        'prepared_dataset_*.pkl',     # Old dataset cache format
+        'training_samples.pkl'        # Old training samples cache
+    ]
+    
+    # Define patterns to keep (for information)
+    keep_patterns = [
+        'llm_embeddings/*',          # Expensive OpenAI embeddings
+        'geocoding/*',               # Expensive geocoding API results
+        'package_metadata.pkl',      # Package metadata
+        'package_features.pkl',      # Package features
+        'package_mappings.pkl',      # ID mappings
+        'user_package_mappings.pkl'  # User/package mappings
+    ]
+    
+    print(f"\nCleaning stale caches in: {cache_dir}")
+    print("=" * 60)
+    
+    removed_count = 0
+    removed_size = 0
+    removed_files = []
+    
+    # Find and remove stale caches
+    for pattern in stale_patterns:
+        files = glob.glob(os.path.join(cache_dir, pattern))
+        
+        for file_path in files:
+            if os.path.exists(file_path):
+                size = os.path.getsize(file_path)
+                size_mb = size / (1024 * 1024)
+                
+                if dry_run:
+                    print(f"[DRY RUN] Would remove: {os.path.basename(file_path)} ({size_mb:.1f} MB)")
+                else:
+                    print(f"Removing: {os.path.basename(file_path)} ({size_mb:.1f} MB)")
+                    os.remove(file_path)
+                
+                removed_files.append(os.path.basename(file_path))
+                removed_count += 1
+                removed_size += size
+    
+    print("\n" + "=" * 60)
+    print(f"Summary: {'Would remove' if dry_run else 'Removed'} {removed_count} files, {removed_size / (1024 * 1024):.1f} MB total")
+    
+    # Show what's being kept
+    print("\nKept caches (expensive to recompute):")
+    kept_count = 0
+    kept_size = 0
+    kept_files = []
+    
+    for pattern in keep_patterns:
+        if '*' in pattern:
+            # Handle directory patterns
+            base_pattern = pattern.replace('/*', '')
+            dir_path = os.path.join(cache_dir, base_pattern)
+            if os.path.exists(dir_path) and os.path.isdir(dir_path):
+                dir_size = sum(
+                    os.path.getsize(os.path.join(dir_path, f))
+                    for f in os.listdir(dir_path)
+                    if os.path.isfile(os.path.join(dir_path, f))
+                )
+                print(f"  - {base_pattern}/ ({dir_size / (1024 * 1024):.1f} MB)")
+                kept_files.append(f"{base_pattern}/")
+                kept_count += len(os.listdir(dir_path))
+                kept_size += dir_size
+        else:
+            # Handle file patterns
+            file_path = os.path.join(cache_dir, pattern)
+            if os.path.exists(file_path):
+                size = os.path.getsize(file_path)
+                print(f"  - {pattern} ({size / (1024 * 1024):.1f} MB)")
+                kept_files.append(pattern)
+                kept_count += 1
+                kept_size += size
+    
+    print(f"\nTotal kept: {kept_count} files, {kept_size / (1024 * 1024):.1f} MB")
+    
+    if dry_run:
+        print("\n⚠️  This was a dry run. Use dry_run=False to actually remove files.")
+    
+    return {
+        'removed_count': removed_count,
+        'removed_size_mb': removed_size / (1024 * 1024),
+        'removed_files': removed_files,
+        'kept_count': kept_count,
+        'kept_size_mb': kept_size / (1024 * 1024),
+        'kept_files': kept_files,
+        'dry_run': dry_run
+    }
+
