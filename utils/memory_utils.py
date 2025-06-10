@@ -64,7 +64,7 @@ class MemoryConfig:
                 'compile_model': False,  # MPS doesn't fully support compile yet
                 'pin_memory': True,  # Use pinned memory for faster transfers
                 'prefetch_factor': 2,  # Less prefetching for MPS
-                'empty_cache_interval': 5,  # Empty MPS cache more frequently
+                'empty_cache_interval': 0,  # Disable cache clearing for better performance
                 'use_float16_for_embeddings': True,  # Use float16 for embeddings when possible
                 'max_batch_size': 256,  # Safer default for various M1/M2/M3 chips
                 'reduce_embedding_dim': True,  # Reduce embedding dimensions to save memory
@@ -177,16 +177,21 @@ def create_memory_config(
         
     elif device_type == 'mps':
         # MPS-specific settings (Apple Silicon)
+        # IMPORTANT: Disable float16 on MPS to prevent dtype mismatch errors
+        config.use_float16_for_embeddings = False
+        config.mps_config['use_float16_for_embeddings'] = False
+        
         if performance_mode == "fastest":
             config.mps_config.update({
                 'max_batch_size': 320,  # Push batch size higher
-                'empty_cache_interval': 10,
+                'empty_cache_interval': 0,  # Disable for better performance
                 'reduce_embedding_dim': True,
+                'use_float16_for_embeddings': False  # Force disable float16
             })
         elif performance_mode == "accurate":
             config.mps_config.update({
                 'max_batch_size': 128,
-                'empty_cache_interval': 3,
+                'empty_cache_interval': 0,  # Disable for better performance
                 'reduce_embedding_dim': False,
                 'use_float16_for_embeddings': False
             })
@@ -869,8 +874,9 @@ class MemoryOptimizer:
         # Clear memory if needed
         if should_clear_memory(batch_idx, self.device_type, self.config):
             clear_memory_with_config(self.device, self.config)
-            if self.track_memory:
-                logger.info(f"Memory cleared at batch {batch_idx}")
+            # Commented out to reduce log clutter
+            # if self.track_memory:
+            #     logger.info(f"Memory cleared at batch {batch_idx}")
     
     def after_batch(self, batch_idx: int):
         """
@@ -891,9 +897,10 @@ class MemoryOptimizer:
                 except:
                     pass
             
+            # Commented out to reduce log clutter
             # Periodically print memory stats
-            if batch_idx % 100 == 0:
-                print_memory_stats(self.device, f"Batch {batch_idx}")
+            # if batch_idx % 100 == 0:
+            #     print_memory_stats(self.device, f"Batch {batch_idx}")
     
     def before_epoch(self, epoch: int):
         """

@@ -59,7 +59,7 @@ class UnifiedMetricsTracker:
     """
     
     def __init__(self, 
-                 k_values: List[int] = [10, 20],
+                 k_values: List[int] = [10, 20, 50],
                  event_weights: Optional[Dict[str, float]] = None,
                  validate_inputs: bool = True):
         """
@@ -90,44 +90,70 @@ class UnifiedMetricsTracker:
     
     def reset(self):
         """Reset all tracked metrics for a new evaluation session"""
-        # Basic tracking metrics
-        self.metrics = {
-            # Overall metrics
-            'recall': {k: [] for k in self.k_values},
-            'mrr': 0.0,
+        # Global hit counters for exact recall calculation
+        self.hit_counts = {
+            # Overall hits
+            'total': {k: 0 for k in self.k_values},
             
-            # Event-specific metrics
-            'purchase_recall': {k: [] for k in self.k_values},
-            'checkout_recall': {k: [] for k in self.k_values},
-            'add_to_cart_recall': {k: [] for k in self.k_values},
-            'intent_recall': {k: [] for k in self.k_values},  # purchase + checkout
+            # Event-specific hits
+            'purchase': {k: 0 for k in self.k_values},
+            'checkout': {k: 0 for k in self.k_values},
+            'add_to_cart': {k: 0 for k in self.k_values},
+            'intent': {k: 0 for k in self.k_values},  # purchase + checkout
             
-            'purchase_mrr': 0.0,
-            'checkout_mrr': 0.0,
-            'add_to_cart_mrr': 0.0,
-            'intent_mrr': 0.0,  # purchase + checkout
+            # Cold start user hits
+            'cold_start_purchase': {k: 0 for k in self.k_values},
+            'cold_start_checkout': {k: 0 for k in self.k_values},
             
-            # Weighted composite metrics
-            'weighted_recall': {k: [] for k in self.k_values},
-            'weighted_mrr': 0.0,
+            # Warm user hits
+            'warm_purchase': {k: 0 for k in self.k_values},
+            'warm_checkout': {k: 0 for k in self.k_values},
             
-            # Validation metrics (precision, ndcg)
-            'precision': {k: [] for k in self.k_values},
-            'ndcg': {k: [] for k in self.k_values},
-            
-            # Loss tracking
-            'loss': []
+            # Weighted hits for composite metrics
+            'weighted': {k: 0.0 for k in self.k_values},
         }
         
-        # Count tracking
-        self.counts = {
+        # Global sample counters
+        self.sample_counts = {
             'total': 0,
             'purchase': 0,
             'checkout': 0,
             'add_to_cart': 0,
             'intent': 0,  # purchase + checkout
-            'view': 0     # regular browsing
+            'view': 0,    # regular browsing
+            'cold_start_purchase': 0,
+            'cold_start_checkout': 0,
+            'warm_purchase': 0,
+            'warm_checkout': 0
         }
+        
+        # MRR accumulators (sum of reciprocal ranks)
+        self.mrr_sums = {
+            'total': 0.0,
+            'purchase': 0.0,
+            'checkout': 0.0,
+            'add_to_cart': 0.0,
+            'intent': 0.0,
+            'weighted': 0.0,
+            'cold_start_purchase': 0.0,
+            'cold_start_checkout': 0.0,
+            'warm_purchase': 0.0,
+            'warm_checkout': 0.0
+        }
+        
+        # Track total weight sum for proper weighted averaging
+        self.total_weight_sum = 0.0
+        
+        # Additional metrics for compatibility
+        self.precision_sums = {k: 0.0 for k in self.k_values}
+        self.ndcg_sums = {k: 0.0 for k in self.k_values}
+        self.loss_sum = 0.0
+        self.loss_count = 0
+        
+        # Track unique items for coverage metrics  
+        self.all_ground_truth_items = set()  # Track all items that should be recommended
+        self.correctly_recommended_items = {k: set() for k in self.k_values}  # Items correctly recommended in top-k
+        self.recommended_items = {k: set() for k in self.k_values}  # ALL items recommended in top-k (for coverage)
     
     def update(self, 
                predictions: torch.Tensor, 
@@ -137,6 +163,7 @@ class UnifiedMetricsTracker:
                has_add_to_cart: Optional[torch.Tensor] = None,
                has_checkout_inclusive: Optional[torch.Tensor] = None,
                has_add_to_cart_inclusive: Optional[torch.Tensor] = None,
+               is_cold_start: Optional[torch.Tensor] = None,
                loss: Optional[float] = None):
         """
         Update metrics with a new batch of predictions and targets.
@@ -149,6 +176,7 @@ class UnifiedMetricsTracker:
             has_add_to_cart: Boolean tensor indicating add-to-cart samples (hierarchical - for weighted recall)
             has_checkout_inclusive: Boolean tensor indicating all checkout samples (for individual recalls)
             has_add_to_cart_inclusive: Boolean tensor indicating all add-to-cart samples (for individual recalls)
+            is_cold_start: Boolean tensor indicating cold start users [batch_size]
             loss: Optional loss value to track
         """
         # Validate inputs if enabled
@@ -202,6 +230,15 @@ class UnifiedMetricsTracker:
                     
                 if len(has_add_to_cart_inclusive.shape) > 1:
                     has_add_to_cart_inclusive = has_add_to_cart_inclusive.squeeze()
+                
+                # Handle is_cold_start flag
+                if is_cold_start is None:
+                    is_cold_start = torch.zeros_like(is_purchase)
+                elif is_cold_start.device != predictions.device:
+                    is_cold_start = is_cold_start.to(predictions.device)
+                    
+                if len(is_cold_start.shape) > 1:
+                    is_cold_start = is_cold_start.squeeze()
                     
                 # Handle empty input case
                 if targets.numel() == 0:
@@ -218,327 +255,336 @@ class UnifiedMetricsTracker:
                 print(f"Error validating inputs: {e}")
                 return
         
-        # Update count metrics
+        # Update sample counts
         batch_size = predictions.size(0)
-        self.counts['total'] += batch_size
-        self.counts['purchase'] += is_purchase.sum().item()
+        self.sample_counts['total'] += batch_size
+        self.sample_counts['purchase'] += is_purchase.sum().item()
         
-        # Calculate intent mask (purchase OR checkout)
+        # Calculate intent mask (purchase OR checkout)  
         intent_mask = is_purchase | has_checkout
-        self.counts['intent'] += intent_mask.sum().item()
+        self.sample_counts['intent'] += intent_mask.sum().item()
         
         # Update checkout and add_to_cart counts using inclusive flags (for individual recalls)
         if has_checkout_inclusive is not None:
-            self.counts['checkout'] += has_checkout_inclusive.sum().item()
+            self.sample_counts['checkout'] += has_checkout_inclusive.sum().item()
         
         if has_add_to_cart_inclusive is not None:
-            self.counts['add_to_cart'] += has_add_to_cart_inclusive.sum().item()
+            self.sample_counts['add_to_cart'] += has_add_to_cart_inclusive.sum().item()
         
         # Calculate view count (none of the above)
         view_mask = ~(is_purchase | has_checkout | has_add_to_cart)
-        self.counts['view'] += view_mask.sum().item()
+        self.sample_counts['view'] += view_mask.sum().item()
+        
+        # Update cold start vs warm user counts
+        if is_cold_start is not None:
+            cold_start_purchases = is_purchase & is_cold_start
+            warm_purchases = is_purchase & ~is_cold_start
+            cold_start_checkouts = has_checkout_inclusive & is_cold_start if has_checkout_inclusive is not None else torch.zeros_like(is_cold_start, dtype=torch.bool)
+            warm_checkouts = has_checkout_inclusive & ~is_cold_start if has_checkout_inclusive is not None else torch.zeros_like(is_cold_start, dtype=torch.bool)
+            
+            self.sample_counts['cold_start_purchase'] += cold_start_purchases.sum().item()
+            self.sample_counts['warm_purchase'] += warm_purchases.sum().item()
+            self.sample_counts['cold_start_checkout'] += cold_start_checkouts.sum().item()
+            self.sample_counts['warm_checkout'] += warm_checkouts.sum().item()
+        
+        # Calculate total weight sum for this batch (for weighted metrics)
+        batch_weights = torch.zeros(batch_size, device=predictions.device)
+        batch_weights[is_purchase] = self.event_weights['purchase']
+        batch_weights[has_checkout & ~is_purchase] = self.event_weights['checkout']
+        batch_weights[has_add_to_cart & ~has_checkout & ~is_purchase] = self.event_weights['add_to_cart']
+        batch_weights[view_mask] = self.event_weights['view']
+        self.total_weight_sum += batch_weights.sum().item()
         
         # Track loss if provided
         if loss is not None:
-            self.metrics['loss'].append(loss)
+            self.loss_sum += loss
+            self.loss_count += 1
         
-        # Calculate detailed metrics
-        batch_metrics = self._calculate_batch_metrics(
-            predictions, targets, is_purchase, has_checkout, has_add_to_cart,
-            has_checkout_inclusive, has_add_to_cart_inclusive
-        )
+        # Store number of items for coverage calculation
+        self._num_items = predictions.size(1)
         
-        # Update metrics with batch results
-        for k in self.k_values:
-            # Overall recall
-            self.metrics['recall'][k].append(batch_metrics['recall'][k])
-            
-            # Event-specific recall
-            if self.counts['purchase'] > 0 and 'purchase_recall' in batch_metrics:
-                self.metrics['purchase_recall'][k].append(batch_metrics['purchase_recall'][k])
-            
-            if self.counts['checkout'] > 0 and 'checkout_recall' in batch_metrics:
-                self.metrics['checkout_recall'][k].append(batch_metrics['checkout_recall'][k])
-            
-            if self.counts['add_to_cart'] > 0 and 'add_to_cart_recall' in batch_metrics:
-                self.metrics['add_to_cart_recall'][k].append(batch_metrics['add_to_cart_recall'][k])
-            
-            if self.counts['intent'] > 0 and 'intent_recall' in batch_metrics:
-                self.metrics['intent_recall'][k].append(batch_metrics['intent_recall'][k])
-            
-            # Weighted composite recall
-            if 'weighted_recall' in batch_metrics:
-                self.metrics['weighted_recall'][k].append(batch_metrics['weighted_recall'][k])
-            
-            # Additional validation metrics
-            if 'precision' in batch_metrics:
-                self.metrics['precision'][k].append(batch_metrics['precision'][k])
-            
-            if 'ndcg' in batch_metrics:
-                self.metrics['ndcg'][k].append(batch_metrics['ndcg'][k])
-        
-        # Update MRR metrics
-        self.metrics['mrr'] += batch_metrics['mrr'] * batch_size
-        
-        if self.counts['purchase'] > 0 and 'purchase_mrr' in batch_metrics:
-            self.metrics['purchase_mrr'] += batch_metrics['purchase_mrr'] * batch_metrics['purchase_count']
-        
-        if self.counts['checkout'] > 0 and 'checkout_mrr' in batch_metrics:
-            self.metrics['checkout_mrr'] += batch_metrics['checkout_mrr'] * batch_metrics['checkout_count_inclusive']
-        
-        if self.counts['add_to_cart'] > 0 and 'add_to_cart_mrr' in batch_metrics:
-            self.metrics['add_to_cart_mrr'] += batch_metrics['add_to_cart_mrr'] * batch_metrics['add_to_cart_count_inclusive']
-        
-        if self.counts['intent'] > 0 and 'intent_mrr' in batch_metrics:
-            self.metrics['intent_mrr'] += batch_metrics['intent_mrr'] * batch_metrics['intent_count']
-        
-        if 'weighted_mrr' in batch_metrics:
-            self.metrics['weighted_mrr'] += batch_metrics['weighted_mrr'] * batch_size
-    
-    def _calculate_batch_metrics(self,
-                                predictions: torch.Tensor,
-                                targets: torch.Tensor,
-                                is_purchase: torch.Tensor,
-                                has_checkout: torch.Tensor,
-                                has_add_to_cart: torch.Tensor,
-                                has_checkout_inclusive: torch.Tensor,
-                                has_add_to_cart_inclusive: torch.Tensor) -> Dict[str, Any]:
-        """
-        Calculate comprehensive metrics for a single batch with event-based weighting.
-        
-        Args:
-            predictions: Model predictions [batch_size, num_items]
-            targets: Ground truth indices [batch_size]
-            is_purchase: Boolean tensor for purchase events [batch_size]
-            has_checkout: Boolean tensor for checkout events (hierarchical) [batch_size]
-            has_add_to_cart: Boolean tensor for add_to_cart events (hierarchical) [batch_size]
-            has_checkout_inclusive: Boolean tensor for all checkout events (inclusive) [batch_size]
-            has_add_to_cart_inclusive: Boolean tensor for all add_to_cart events (inclusive) [batch_size]
-            
-        Returns:
-            Dictionary of metrics including recall@k, MRR, and weighted metrics
-        """
-        batch_size = predictions.size(0)
+        # Get top-k predictions for all k values
         max_k = max(self.k_values)
+        _, top_k_indices = torch.topk(predictions, max_k, dim=1)
         
-        # Initialize metrics dictionary
-        metrics = {
-            'recall': {k: 0.0 for k in self.k_values},
-            'mrr': 0.0,
-            'weighted_recall': {k: 0.0 for k in self.k_values},
-            'weighted_mrr': 0.0,
-            'precision': {k: 0.0 for k in self.k_values},
-            'ndcg': {k: 0.0 for k in self.k_values}
-        }
+        # Calculate matches for each sample
+        targets_expanded = targets.unsqueeze(1).expand(-1, max_k)
+        matches = (top_k_indices == targets_expanded)  # [batch_size, max_k]
         
-        # Track event counts
-        purchase_count = is_purchase.sum().item()
-        checkout_count = has_checkout.sum().item()  # Hierarchical count for weighted recall
-        add_to_cart_count = has_add_to_cart.sum().item()  # Hierarchical count for weighted recall
+        # Calculate ranks (position of first match + 1, or inf if no match)
+        first_match_positions = torch.full((batch_size,), float('inf'), device=predictions.device)
+        has_match = matches.any(dim=1)
+        if has_match.any():
+            # Get position of first match for each sample that has a match
+            first_match_pos = matches.int().argmax(dim=1)  # Position of first True
+            # Only set positions for samples that actually have matches
+            first_match_positions[has_match] = first_match_pos[has_match].float() + 1
         
-        # Track inclusive event counts for individual recalls
-        checkout_count_inclusive = has_checkout_inclusive.sum().item()
-        add_to_cart_count_inclusive = has_add_to_cart_inclusive.sum().item()
+        # Convert to CPU for counting
+        ranks = first_match_positions.cpu()
+        has_match_cpu = has_match.cpu()
+        is_purchase_cpu = is_purchase.cpu()
+        intent_mask_cpu = intent_mask.cpu()
         
-        # Calculate intent mask (purchase OR checkout)
-        intent_mask = is_purchase | has_checkout
-        intent_count = intent_mask.sum().item()
-        
-        # Add count information to metrics
-        metrics['purchase_count'] = purchase_count
-        metrics['checkout_count'] = checkout_count
-        metrics['add_to_cart_count'] = add_to_cart_count
-        metrics['intent_count'] = intent_count
-        
-        # Add inclusive counts for debugging
-        metrics['checkout_count_inclusive'] = checkout_count_inclusive
-        metrics['add_to_cart_count_inclusive'] = add_to_cart_count_inclusive
-        
-        # Get top-k predictions
-        _, top_indices = torch.topk(predictions, min(max_k, predictions.size(1)), dim=1)
-        
-        # Create expanded targets for comparison
-        expanded_targets = targets.unsqueeze(1).expand(-1, top_indices.size(1))
-        
-        # Calculate matches
-        matches = (top_indices == expanded_targets)
-        
-        # Prepare event type tensors for weighted metrics with hierarchical priority
-        # Hierarchy: Purchase > InitiateCheckout > AddToCart > View
-        # A session should only count for the highest event type it contains
-        event_weights_tensor = torch.ones(batch_size, device=predictions.device) * self.event_weights['view']
-        
-        # Start with lowest priority and work up (so higher priority overwrites)
-        event_weights_tensor[has_add_to_cart] = self.event_weights['add_to_cart']
-        
-        # InitiateCheckout overwrites AddToCart if both are present
-        event_weights_tensor[has_checkout] = self.event_weights['checkout'] 
-        
-        # Purchase overwrites all others if present (highest priority)
-        event_weights_tensor[is_purchase] = self.event_weights['purchase']
-        
-        # Calculate rank information
-        ranks = torch.zeros(batch_size, device=predictions.device)
-        has_match = torch.zeros(batch_size, dtype=torch.bool, device=predictions.device)
-        
-        for i in range(batch_size):
-            match_positions = matches[i].nonzero(as_tuple=True)[0]
-            if len(match_positions) > 0:
-                has_match[i] = True
-                # +1 because ranks start from 1
-                ranks[i] = match_positions[0].item() + 1
-            else:
-                # No match, set to max rank + 1
-                ranks[i] = top_indices.size(1) + 1
-        
-        # Calculate reciprocal rank
-        reciprocal_ranks = torch.zeros_like(ranks)
-        reciprocal_ranks[has_match] = 1.0 / ranks[has_match]
-        
-        # Overall MRR
-        metrics['mrr'] = reciprocal_ranks.mean().item()
-        
-        # Purchase MRR
-        if purchase_count > 0:
-            metrics['purchase_mrr'] = reciprocal_ranks[is_purchase].mean().item()
+        if has_checkout_inclusive is not None:
+            has_checkout_inclusive_cpu = has_checkout_inclusive.cpu()
+        else:
+            has_checkout_inclusive_cpu = torch.zeros_like(is_purchase_cpu)
             
-        # Checkout MRR (using inclusive flags)
-        if checkout_count_inclusive > 0:
-            metrics['checkout_mrr'] = reciprocal_ranks[has_checkout_inclusive].mean().item()
-            
-        # Add to cart MRR (using inclusive flags)
-        if add_to_cart_count_inclusive > 0:
-            metrics['add_to_cart_mrr'] = reciprocal_ranks[has_add_to_cart_inclusive].mean().item()
-            
-        # Intent MRR (purchase + checkout)
-        if intent_count > 0:
-            metrics['intent_mrr'] = reciprocal_ranks[intent_mask].mean().item()
+        if has_add_to_cart_inclusive is not None:
+            has_add_to_cart_inclusive_cpu = has_add_to_cart_inclusive.cpu()
+        else:
+            has_add_to_cart_inclusive_cpu = torch.zeros_like(is_purchase_cpu)
         
-        # Weighted MRR using event weights
-        weighted_ranks = reciprocal_ranks * event_weights_tensor
-        metrics['weighted_mrr'] = weighted_ranks.sum().item() / event_weights_tensor.sum().item()
+        # Handle cold start flag on CPU
+        if is_cold_start is not None:
+            is_cold_start_cpu = is_cold_start.cpu()
+        else:
+            is_cold_start_cpu = torch.zeros_like(is_purchase_cpu)
         
-        # Calculate recall@k and other metrics for each k value
+        # Update global hit counts and MRR sums for each k
         for k in self.k_values:
-            # Overall recall@k
-            in_top_k = matches[:, :k].any(dim=1).float()
-            metrics['recall'][k] = in_top_k.mean().item()
+            # Samples that hit in top-k
+            in_top_k = has_match_cpu & (ranks <= k)
             
-            # Event-specific recall@k (using inclusive flags for individual recalls)
-            if purchase_count > 0:
-                metrics['purchase_recall'] = {k: 0.0 for k in self.k_values}
-                metrics['purchase_recall'][k] = in_top_k[is_purchase].mean().item()
+            # Overall hits
+            self.hit_counts['total'][k] += in_top_k.sum().item()
+            
+            # Event-specific hits
+            purchase_hits = in_top_k & is_purchase_cpu
+            self.hit_counts['purchase'][k] += purchase_hits.sum().item()
+            
+            checkout_hits = in_top_k & has_checkout_inclusive_cpu
+            self.hit_counts['checkout'][k] += checkout_hits.sum().item()
+            
+            add_to_cart_hits = in_top_k & has_add_to_cart_inclusive_cpu
+            self.hit_counts['add_to_cart'][k] += add_to_cart_hits.sum().item()
+            
+            intent_hits = in_top_k & intent_mask_cpu
+            self.hit_counts['intent'][k] += intent_hits.sum().item()
+            
+            # Cold start vs warm user hits
+            if is_cold_start is not None:
+                cold_start_purchase_hits = in_top_k & is_purchase_cpu & is_cold_start_cpu
+                warm_purchase_hits = in_top_k & is_purchase_cpu & ~is_cold_start_cpu
+                cold_start_checkout_hits = in_top_k & has_checkout_inclusive_cpu & is_cold_start_cpu
+                warm_checkout_hits = in_top_k & has_checkout_inclusive_cpu & ~is_cold_start_cpu
                 
-            if checkout_count_inclusive > 0:
-                metrics['checkout_recall'] = {k: 0.0 for k in self.k_values}
-                metrics['checkout_recall'][k] = in_top_k[has_checkout_inclusive].mean().item()
-                
-            if add_to_cart_count_inclusive > 0:
-                metrics['add_to_cart_recall'] = {k: 0.0 for k in self.k_values}
-                metrics['add_to_cart_recall'][k] = in_top_k[has_add_to_cart_inclusive].mean().item()
-                
-            if intent_count > 0:
-                metrics['intent_recall'] = {k: 0.0 for k in self.k_values}
-                metrics['intent_recall'][k] = in_top_k[intent_mask].mean().item()
+                self.hit_counts['cold_start_purchase'][k] += cold_start_purchase_hits.sum().item()
+                self.hit_counts['warm_purchase'][k] += warm_purchase_hits.sum().item()
+                self.hit_counts['cold_start_checkout'][k] += cold_start_checkout_hits.sum().item()
+                self.hit_counts['warm_checkout'][k] += warm_checkout_hits.sum().item()
             
-            # Weighted recall@k
-            weighted_recall = (in_top_k * event_weights_tensor).sum() / event_weights_tensor.sum()
-            metrics['weighted_recall'][k] = weighted_recall.item()
-            
-            # Precision@k (different from recall - considers all top k predictions)
-            # For binary relevance, precision@k = # relevant items in top k / k
-            precision_at_k = matches[:, :k].sum(dim=1).float() / k
-            metrics['precision'][k] = precision_at_k.mean().item()
-            
-            # NDCG@k (position-aware metric)
-            ndcg_values = torch.zeros(batch_size, device=predictions.device)
+            # Weighted hits for composite metrics
             for i in range(batch_size):
-                if has_match[i] and ranks[i] <= k:
-                    # Position in ranking (0-indexed)
-                    position = ranks[i].item() - 1
-                    # DCG = 1 / log2(position + 2)  [+2 because position is 0-indexed and log2(1) is 0]
-                    dcg = 1.0 / torch.log2(torch.tensor(position + 2, device=predictions.device))
-                    # IDCG for binary relevance is always 1 / log2(2) = 1
-                    ndcg_values[i] = dcg
+                if in_top_k[i]:
+                    weight = 0.0
+                    if is_purchase_cpu[i]:
+                        weight = self.event_weights['purchase']
+                    elif has_checkout is not None and has_checkout[i]:
+                        weight = self.event_weights['checkout']
+                    elif has_add_to_cart is not None and has_add_to_cart[i]:
+                        weight = self.event_weights['add_to_cart']
+                    else:
+                        weight = self.event_weights['view']
+                    self.hit_counts['weighted'][k] += weight
+        
+        # Update MRR sums (only for samples with matches)
+        valid_ranks = ranks[has_match_cpu & (ranks < float('inf'))]
+        if len(valid_ranks) > 0:
+            reciprocal_ranks = 1.0 / valid_ranks
             
-            metrics['ndcg'][k] = ndcg_values.mean().item()
+            # Event-specific MRR
+            purchase_matches = has_match_cpu & is_purchase_cpu
+            if purchase_matches.any():
+                purchase_ranks = ranks[purchase_matches]
+                purchase_valid = purchase_ranks < float('inf')
+                if purchase_valid.any():
+                    self.mrr_sums['purchase'] += (1.0 / purchase_ranks[purchase_valid]).sum().item()
             
-        return metrics
+            checkout_matches = has_match_cpu & has_checkout_inclusive_cpu
+            if checkout_matches.any():
+                checkout_ranks = ranks[checkout_matches]
+                checkout_valid = checkout_ranks < float('inf')
+                if checkout_valid.any():
+                    self.mrr_sums['checkout'] += (1.0 / checkout_ranks[checkout_valid]).sum().item()
+            
+            add_to_cart_matches = has_match_cpu & has_add_to_cart_inclusive_cpu
+            if add_to_cart_matches.any():
+                add_to_cart_ranks = ranks[add_to_cart_matches]
+                add_to_cart_valid = add_to_cart_ranks < float('inf')
+                if add_to_cart_valid.any():
+                    self.mrr_sums['add_to_cart'] += (1.0 / add_to_cart_ranks[add_to_cart_valid]).sum().item()
+            
+            intent_matches = has_match_cpu & intent_mask_cpu
+            if intent_matches.any():
+                intent_ranks = ranks[intent_matches]
+                intent_valid = intent_ranks < float('inf')
+                if intent_valid.any():
+                    self.mrr_sums['intent'] += (1.0 / intent_ranks[intent_valid]).sum().item()
+            
+            # Cold start vs warm user MRR
+            if is_cold_start is not None:
+                cold_start_purchase_matches = has_match_cpu & is_purchase_cpu & is_cold_start_cpu
+                if cold_start_purchase_matches.any():
+                    cold_start_purchase_ranks = ranks[cold_start_purchase_matches]
+                    cold_start_purchase_valid = cold_start_purchase_ranks < float('inf')
+                    if cold_start_purchase_valid.any():
+                        self.mrr_sums['cold_start_purchase'] += (1.0 / cold_start_purchase_ranks[cold_start_purchase_valid]).sum().item()
+                
+                warm_purchase_matches = has_match_cpu & is_purchase_cpu & ~is_cold_start_cpu
+                if warm_purchase_matches.any():
+                    warm_purchase_ranks = ranks[warm_purchase_matches]
+                    warm_purchase_valid = warm_purchase_ranks < float('inf')
+                    if warm_purchase_valid.any():
+                        self.mrr_sums['warm_purchase'] += (1.0 / warm_purchase_ranks[warm_purchase_valid]).sum().item()
+                
+                cold_start_checkout_matches = has_match_cpu & has_checkout_inclusive_cpu & is_cold_start_cpu
+                if cold_start_checkout_matches.any():
+                    cold_start_checkout_ranks = ranks[cold_start_checkout_matches]
+                    cold_start_checkout_valid = cold_start_checkout_ranks < float('inf')
+                    if cold_start_checkout_valid.any():
+                        self.mrr_sums['cold_start_checkout'] += (1.0 / cold_start_checkout_ranks[cold_start_checkout_valid]).sum().item()
+                
+                warm_checkout_matches = has_match_cpu & has_checkout_inclusive_cpu & ~is_cold_start_cpu
+                if warm_checkout_matches.any():
+                    warm_checkout_ranks = ranks[warm_checkout_matches]
+                    warm_checkout_valid = warm_checkout_ranks < float('inf')
+                    if warm_checkout_valid.any():
+                        self.mrr_sums['warm_checkout'] += (1.0 / warm_checkout_ranks[warm_checkout_valid]).sum().item()
+            
+            # Weighted MRR
+            for i in range(batch_size):
+                if has_match_cpu[i] and ranks[i] < float('inf'):
+                    weight = 0.0
+                    if is_purchase_cpu[i]:
+                        weight = self.event_weights['purchase']
+                    elif has_checkout is not None and has_checkout[i]:
+                        weight = self.event_weights['checkout']
+                    elif has_add_to_cart is not None and has_add_to_cart[i]:
+                        weight = self.event_weights['add_to_cart']
+                    else:
+                        weight = self.event_weights['view']
+                    self.mrr_sums['weighted'] += weight * (1.0 / ranks[i].item())
+        
+        # Track items for coverage metrics
+        ground_truth_items = targets.cpu().numpy().tolist()
+        self.all_ground_truth_items.update(ground_truth_items)
+        
+        for k in self.k_values:
+            # Track ALL recommended items in top-k (for coverage calculation)
+            top_k_items = top_k_indices[:, :k].cpu().numpy().flatten().tolist()
+            self.recommended_items[k].update(top_k_items)
+            
+            # Track correctly recommended items in top-k
+            in_top_k = has_match_cpu & (ranks <= k)
+            if in_top_k.any():
+                correct_items = targets[in_top_k].cpu().numpy().tolist()
+                self.correctly_recommended_items[k].update(correct_items)
+    
+    # DEPRECATED: Removed _calculate_batch_metrics method to avoid confusion
+    # Now using global counters for exact metrics calculation
     
     def compute(self) -> Dict[str, Any]:
         """
-        Compute final metrics by averaging over all batches.
+        Compute final metrics using exact global counts.
         
         Returns:
-            Dictionary of all metrics averaged over evaluation batches
+            Dictionary of all metrics calculated from global hit/sample counts
         """
         results = {}
         
-        # Loss
-        if self.metrics['loss']:
-            results['loss'] = np.mean(self.metrics['loss'])
+        # Loss (if tracked)
+        if self.loss_count > 0:
+            results['loss'] = self.loss_sum / self.loss_count
         
-        # Recall@k metrics for all event types and weighted composite
+        # Recall@k metrics using exact global counts
         for k in self.k_values:
-            # Overall recall
-            results[f'recall@{k}'] = np.mean(self.metrics['recall'][k])
-            
-            # Event-specific recall
-            if self.counts['purchase'] > 0 and self.metrics['purchase_recall'][k]:
-                results[f'purchase_recall@{k}'] = np.mean(self.metrics['purchase_recall'][k])
+            # Event-specific recall = event_hits_at_k / event_samples
+            if self.sample_counts['purchase'] > 0:
+                results[f'purchase_recall@{k}'] = self.hit_counts['purchase'][k] / self.sample_counts['purchase']
             else:
                 results[f'purchase_recall@{k}'] = 0.0
                 
-            if self.counts['checkout'] > 0 and self.metrics['checkout_recall'][k]:
-                results[f'checkout_recall@{k}'] = np.mean(self.metrics['checkout_recall'][k])
+            if self.sample_counts['checkout'] > 0:
+                results[f'checkout_recall@{k}'] = self.hit_counts['checkout'][k] / self.sample_counts['checkout']
             else:
                 results[f'checkout_recall@{k}'] = 0.0
-                
-            if self.counts['add_to_cart'] > 0 and self.metrics['add_to_cart_recall'][k]:
-                results[f'add_to_cart_recall@{k}'] = np.mean(self.metrics['add_to_cart_recall'][k])
-            else:
-                results[f'add_to_cart_recall@{k}'] = 0.0
-                
-            if self.counts['intent'] > 0 and self.metrics['intent_recall'][k]:
-                results[f'intent_recall@{k}'] = np.mean(self.metrics['intent_recall'][k])
-            else:
-                results[f'intent_recall@{k}'] = 0.0
             
-            # Weighted composite recall
-            results[f'weighted_recall@{k}'] = np.mean(self.metrics['weighted_recall'][k])
+            # Cold start vs warm user recall
+            if self.sample_counts['cold_start_purchase'] > 0:
+                results[f'cold_start_purchase_recall@{k}'] = self.hit_counts['cold_start_purchase'][k] / self.sample_counts['cold_start_purchase']
+            else:
+                results[f'cold_start_purchase_recall@{k}'] = 0.0
+                
+            if self.sample_counts['warm_purchase'] > 0:
+                results[f'warm_purchase_recall@{k}'] = self.hit_counts['warm_purchase'][k] / self.sample_counts['warm_purchase']
+            else:
+                results[f'warm_purchase_recall@{k}'] = 0.0
+                
+            if self.sample_counts['cold_start_checkout'] > 0:
+                results[f'cold_start_checkout_recall@{k}'] = self.hit_counts['cold_start_checkout'][k] / self.sample_counts['cold_start_checkout']
+            else:
+                results[f'cold_start_checkout_recall@{k}'] = 0.0
+                
+            if self.sample_counts['warm_checkout'] > 0:
+                results[f'warm_checkout_recall@{k}'] = self.hit_counts['warm_checkout'][k] / self.sample_counts['warm_checkout']
+            else:
+                results[f'warm_checkout_recall@{k}'] = 0.0
             
-            # Additional validation metrics
-            results[f'precision@{k}'] = np.mean(self.metrics['precision'][k])
-            results[f'ndcg@{k}'] = np.mean(self.metrics['ndcg'][k])
+            # Item coverage (unique items correctly recommended in top-k)
+            if self.all_ground_truth_items:
+                results[f'item_coverage@{k}'] = len(self.correctly_recommended_items[k]) / len(self.all_ground_truth_items)
+            else:
+                results[f'item_coverage@{k}'] = 0.0
         
-        # MRR metrics
-        results['mrr'] = self.metrics['mrr'] / max(self.counts['total'], 1)
-        
-        if self.counts['purchase'] > 0:
-            results['purchase_mrr'] = self.metrics['purchase_mrr'] / self.counts['purchase']
+        # Event-specific MRR
+        if self.sample_counts['purchase'] > 0:
+            results['purchase_mrr'] = self.mrr_sums['purchase'] / self.sample_counts['purchase']
         else:
             results['purchase_mrr'] = 0.0
             
-        if self.counts['checkout'] > 0:
-            results['checkout_mrr'] = self.metrics['checkout_mrr'] / self.counts['checkout']
+        if self.sample_counts['checkout'] > 0:
+            results['checkout_mrr'] = self.mrr_sums['checkout'] / self.sample_counts['checkout']
         else:
             results['checkout_mrr'] = 0.0
-            
-        if self.counts['add_to_cart'] > 0:
-            results['add_to_cart_mrr'] = self.metrics['add_to_cart_mrr'] / self.counts['add_to_cart']
-        else:
-            results['add_to_cart_mrr'] = 0.0
-            
-        if self.counts['intent'] > 0:
-            results['intent_mrr'] = self.metrics['intent_mrr'] / self.counts['intent']
-        else:
-            results['intent_mrr'] = 0.0
         
-        # Weighted MRR
-        results['weighted_mrr'] = self.metrics['weighted_mrr'] / max(self.counts['total'], 1)
+        # Cold start vs warm user MRR
+        if self.sample_counts['cold_start_purchase'] > 0:
+            results['cold_start_purchase_mrr'] = self.mrr_sums['cold_start_purchase'] / self.sample_counts['cold_start_purchase']
+        else:
+            results['cold_start_purchase_mrr'] = 0.0
+            
+        if self.sample_counts['warm_purchase'] > 0:
+            results['warm_purchase_mrr'] = self.mrr_sums['warm_purchase'] / self.sample_counts['warm_purchase']
+        else:
+            results['warm_purchase_mrr'] = 0.0
+            
+        if self.sample_counts['cold_start_checkout'] > 0:
+            results['cold_start_checkout_mrr'] = self.mrr_sums['cold_start_checkout'] / self.sample_counts['cold_start_checkout']
+        else:
+            results['cold_start_checkout_mrr'] = 0.0
+            
+        if self.sample_counts['warm_checkout'] > 0:
+            results['warm_checkout_mrr'] = self.mrr_sums['warm_checkout'] / self.sample_counts['warm_checkout']
+        else:
+            results['warm_checkout_mrr'] = 0.0
         
-        # Add counts to results
-        results.update(self.counts)
+        # Item coverage metrics
+        # Calculate what percentage of the total item catalog is being recommended
+        # Assuming the number of items is the size of the prediction tensor's second dimension
+        # This will be set properly when predictions are provided
+        if hasattr(self, '_num_items'):
+            for k in self.k_values:
+                if self._num_items > 0:
+                    results[f'item_coverage@{k}'] = len(self.recommended_items[k]) / self._num_items
+                else:
+                    results[f'item_coverage@{k}'] = 0.0
+        
+        # Sample counts for debugging and transparency
+        results['counts'] = self.sample_counts.copy()
+        results['hit_counts'] = {k: dict(v) if isinstance(v, dict) else v for k, v in self.hit_counts.items()}
+        results['total_weight_sum'] = self.total_weight_sum
         
         return results
 
@@ -1506,7 +1552,9 @@ class EnhancedEventMetrics:
         is_purchase: torch.Tensor,
         has_checkout: torch.Tensor,
         has_add_to_cart: torch.Tensor,
-        k_values: List[int] = [10, 20]
+        k_values: List[int] = [10, 20],
+        has_checkout_inclusive: Optional[torch.Tensor] = None,
+        has_add_to_cart_inclusive: Optional[torch.Tensor] = None
     ) -> Dict[str, Any]:
         """Calculate metrics with event type awareness - Legacy interface"""
         tracker = UnifiedMetricsTracker(k_values=k_values)
@@ -1515,7 +1563,9 @@ class EnhancedEventMetrics:
             targets=targets,
             is_purchase=is_purchase,
             has_checkout=has_checkout,
-            has_add_to_cart=has_add_to_cart
+            has_add_to_cart=has_add_to_cart,
+            has_checkout_inclusive=has_checkout_inclusive,
+            has_add_to_cart_inclusive=has_add_to_cart_inclusive
         )
         results = tracker.compute()
         
@@ -1561,6 +1611,61 @@ class EnhancedEventMetrics:
         legacy_results['intent_mrr'] = results.get('intent_mrr', 0.0)
         
         return legacy_results
+
+
+def calculate_item_coverage(model, data_loader, device, k=20):
+    """
+    Simple standalone function to calculate item coverage@k metric.
+    
+    Item coverage measures what percentage of the total item catalog 
+    is being recommended across all users.
+    
+    Args:
+        model: The recommendation model
+        data_loader: DataLoader containing the data
+        device: Device to run on (cuda, mps, cpu)
+        k: Number of top items to consider (default: 20)
+        
+    Returns:
+        float: Item coverage as a fraction (0-1)
+    """
+    model.eval()
+    recommended_items = set()
+    num_items = None
+    
+    with torch.no_grad():
+        for batch in data_loader:
+            # Move batch to device
+            if isinstance(batch, dict):
+                for key in batch:
+                    if isinstance(batch[key], torch.Tensor):
+                        batch[key] = batch[key].to(device)
+                    elif isinstance(batch[key], dict):
+                        for sub_key in batch[key]:
+                            if isinstance(batch[key][sub_key], torch.Tensor):
+                                batch[key][sub_key] = batch[key][sub_key].to(device)
+            
+            # Get predictions
+            outputs = model(batch)
+            predictions = outputs['predictions']
+            
+            # Store number of items
+            if num_items is None:
+                num_items = predictions.shape[1]
+            
+            # Get top-k items for each prediction
+            _, top_k_items = torch.topk(predictions, min(k, predictions.shape[1]), dim=1)
+            
+            # Add to set of recommended items
+            for items in top_k_items:
+                recommended_items.update(items.cpu().numpy().tolist())
+    
+    # Calculate coverage
+    if num_items is None or num_items == 0:
+        return 0.0
+    
+    coverage = len(recommended_items) / num_items
+    return coverage
 
 
 # Test backward compatibility after all classes are defined

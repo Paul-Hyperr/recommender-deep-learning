@@ -48,47 +48,49 @@ def filter_by_min_session_length(samples: List[Dict], min_session_length: int = 
     users_with_no_quality_sessions = 0
     
     for user_id, user_session_samples in user_samples.items():
-        # First find quality samples for this user
-        user_quality_samples = []
+        # Separate purchase and non-purchase samples
+        user_purchase_samples = [s for s in user_session_samples if s.get('is_purchase', False)]
+        user_non_purchase_samples = [s for s in user_session_samples if not s.get('is_purchase', False)]
         
-        for sample in user_session_samples:
+        # ALWAYS keep ALL purchase samples regardless of length
+        quality_samples.extend(user_purchase_samples)
+        
+        # For non-purchase samples, apply length filter
+        user_quality_non_purchase = []
+        for sample in user_non_purchase_samples:
             # Count interactions in short-term
             short_term_length = len(sample.get('short_term_packages', []))
             
-            # Only keep samples with sufficient interactions
+            # Only keep non-purchase samples with sufficient interactions
             if short_term_length >= min_session_length:
-                user_quality_samples.append(sample)
+                user_quality_non_purchase.append(sample)
         
-        # If user has quality samples, add them all
-        if user_quality_samples:
-            quality_samples.extend(user_quality_samples)
-        # If user has no quality samples but has purchase samples, keep those
-        else:
-            # Find purchase samples for this user
-            purchase_samples = [s for s in user_session_samples if s.get('is_purchase', False)]
-            
-            if purchase_samples:
-                # Keep all purchase samples even if they're short
-                quality_samples.extend(purchase_samples)
-            else:
-                # Otherwise keep their longest session
-                if user_session_samples:
-                    best_sample = max(user_session_samples, 
-                                     key=lambda s: len(s.get('short_term_packages', [])))
-                    quality_samples.append(best_sample)
-                    
+        # Add quality non-purchase samples
+        if user_quality_non_purchase:
+            quality_samples.extend(user_quality_non_purchase)
+        # If user has no quality non-purchase samples, keep their best one
+        elif not user_purchase_samples and user_non_purchase_samples:
+            # Only count as "no quality sessions" if they have no purchases
+            best_sample = max(user_non_purchase_samples, 
+                             key=lambda s: len(s.get('short_term_packages', [])))
+            quality_samples.append(best_sample)
             users_with_no_quality_sessions += 1
     
     # Count samples after
     total_after = len(quality_samples)
     
+    # Count purchases before and after
+    purchases_before = sum(1 for s in samples if s.get('is_purchase', False))
+    purchases_after = sum(1 for s in quality_samples if s.get('is_purchase', False))
+    
     print(f"Samples after session length filtering: {total_after} ({total_after/total_before*100:.1f}%)")
-    print(f"Users without quality sessions (fallback to best): {users_with_no_quality_sessions}")
+    print(f"  Purchase samples: {purchases_before} -> {purchases_after} (preserved {purchases_after/purchases_before*100:.1f}%)")
+    print(f"  Users without quality sessions (fallback to best): {users_with_no_quality_sessions}")
     
     return quality_samples
 
 
-def filter_items_by_frequency(samples: List[Dict], min_frequency: int = 50) -> Tuple[List[Dict], set]:
+def filter_items_by_frequency(samples: List[Dict], min_frequency: int = 10) -> Tuple[List[Dict], set]:
     """Filter items that appear less than min_frequency times
     
     For non-purchase samples, a package must have at least min_frequency interactions to be included
@@ -162,15 +164,15 @@ def filter_items_by_frequency(samples: List[Dict], min_frequency: int = 50) -> T
     return filtered_samples, valid_packages
 
 
-def time_based_split_year(samples: List[Dict], train_ratio: float = 0.93) -> Tuple[List[Dict], List[Dict]]:
+def time_based_split_year(samples: List[Dict], train_ratio: float = 0.91) -> Tuple[List[Dict], List[Dict], Optional[str]]:
     """Split samples based on time for a year of data
     
     Args:
         samples: List of training samples
-        train_ratio: Ratio of samples to use for training (default: 0.93)
+        train_ratio: Ratio of samples to use for training (default: 0.91)
         
     Returns:
-        Tuple of (train_samples, test_samples)
+        Tuple of (train_samples, test_samples, split_date_str)
     """
     print(f"\nApplying time-based split ({train_ratio*100:.0f}% train, {(1-train_ratio)*100:.0f}% test)...")
     
@@ -179,7 +181,7 @@ def time_based_split_year(samples: List[Dict], train_ratio: float = 0.93) -> Tup
         print("Warning: No timestamps found, using random split")
         indices = np.random.permutation(len(samples))
         split_idx = int(len(samples) * train_ratio)
-        return [samples[i] for i in indices[:split_idx]], [samples[i] for i in indices[split_idx:]]
+        return [samples[i] for i in indices[:split_idx]], [samples[i] for i in indices[split_idx:]], None
     
     # Determine if timestamps are epoch or datetime strings
     # Try to infer timestamp format from first sample
@@ -233,7 +235,8 @@ def time_based_split_year(samples: List[Dict], train_ratio: float = 0.93) -> Tup
         split_date = first_date + train_duration
         split_date = split_date.normalize() + pd.Timedelta(days=1)
         
-        print(f"Split date: {split_date.date()}")
+        split_date_str = split_date.date().isoformat()
+        print(f"Split date: {split_date_str}")
         
         # Split samples
         train_samples = []
@@ -262,11 +265,100 @@ def time_based_split_year(samples: List[Dict], train_ratio: float = 0.93) -> Tup
         split_idx = int(len(samples_sorted) * train_ratio)
         train_samples = samples_sorted[:split_idx]
         test_samples = samples_sorted[split_idx:]
+        split_date_str = None  # No split date available in fallback case
     
     print(f"Train samples: {len(train_samples):,}")
     print(f"Test samples: {len(test_samples):,}")
     
-    return train_samples, test_samples
+    return train_samples, test_samples, split_date_str
+
+
+def extract_test_events_from_parquet(input_path: str = "data/bookit_events_2_months.parquet", 
+                                    output_path: str = "data/test_events.parquet",
+                                    train_ratio: float = 0.91) -> str:
+    """
+    Extract test events from the original parquet file based on time-based split.
+    Uses the same logic as time_based_split_year() but works on raw events data.
+    
+    Args:
+        input_path: Path to the full events parquet file
+        output_path: Path to save the test events parquet file  
+        train_ratio: Ratio of data to use for training (default: 0.91, so 9% for test)
+        
+    Returns:
+        Path to the created test events file
+    """
+    import pandas as pd
+    import numpy as np
+    
+    print(f"Extracting test events from {input_path}...")
+    
+    # Check if test file already exists
+    if os.path.exists(output_path):
+        print(f"Test events file already exists: {output_path}")
+        return output_path
+    
+    # Load events
+    events_df = pd.read_parquet(input_path)
+    print(f"Loaded {len(events_df):,} events")
+    
+    # Find timestamp column
+    timestamp_col = None
+    for col in ['created_at', 'timestamp', 'event_time', 'time', 'date']:
+        if col in events_df.columns:
+            timestamp_col = col
+            break
+    
+    if timestamp_col is None:
+        raise ValueError(f"No timestamp column found in the events data. Available columns: {list(events_df.columns)}")
+    
+    # Convert timestamp to datetime (same logic as time_based_split_year)
+    if events_df[timestamp_col].dtype == 'object':
+        try:
+            events_df[timestamp_col] = pd.to_datetime(events_df[timestamp_col])
+        except:
+            # Try as numeric timestamp  
+            events_df[timestamp_col] = pd.to_datetime(events_df[timestamp_col], unit='ms')
+    elif np.issubdtype(events_df[timestamp_col].dtype, np.number):
+        # Determine if milliseconds or seconds by magnitude
+        first_ts = events_df[timestamp_col].iloc[0]
+        if first_ts > 1e12:  # Likely milliseconds
+            events_df[timestamp_col] = pd.to_datetime(events_df[timestamp_col], unit='ms')
+        else:  # Likely seconds
+            events_df[timestamp_col] = pd.to_datetime(events_df[timestamp_col], unit='s')
+    
+    # Sort by timestamp
+    events_df = events_df.sort_values(timestamp_col)
+    
+    # Get time range  
+    first_date = events_df[timestamp_col].min()
+    last_date = events_df[timestamp_col].max()
+    
+    print(f"Data spans from {first_date.date()} to {last_date.date()}")
+    
+    # Calculate split point (same logic as time_based_split_year)
+    total_duration = last_date - first_date
+    train_duration = total_duration * train_ratio
+    split_date = first_date + train_duration
+    split_date = split_date.normalize() + pd.Timedelta(days=1)
+    
+    print(f"Split date: {split_date.date()}")
+    print(f"Test period: {split_date.date()} to {last_date.date()}")
+    
+    # Extract test events
+    test_events = events_df[events_df[timestamp_col] >= split_date].copy()
+    
+    print(f"Test events: {len(test_events):,} ({len(test_events)/len(events_df)*100:.1f}%)")
+    
+    # Create output directory if needed
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # Save test events
+    test_events.to_parquet(output_path, index=False)
+    
+    print(f"✅ Test data saved to {output_path}")
+    
+    return output_path
 
 
 def identify_event_types(samples: List[Dict], event_to_idx: Dict[str, int]) -> List[Dict]:
@@ -310,6 +402,10 @@ def identify_event_types(samples: List[Dict], event_to_idx: Dict[str, int]) -> L
         sample['has_checkout'] = has_checkout
         sample['has_add_to_cart'] = has_add_to_cart
         
+        # Also set inclusive flags for individual event recall calculations
+        sample['has_checkout_inclusive'] = has_checkout
+        sample['has_add_to_cart_inclusive'] = has_add_to_cart
+        
         # Categorize samples
         if has_checkout and not has_add_to_cart:
             checkout_only_samples.append(sample)
@@ -338,6 +434,10 @@ def identify_event_types(samples: List[Dict], event_to_idx: Dict[str, int]) -> L
         # Add flags to sample
         sample['has_checkout'] = has_checkout
         sample['has_add_to_cart'] = has_add_to_cart
+        
+        # Also set inclusive flags for individual event recall calculations
+        sample['has_checkout_inclusive'] = has_checkout
+        sample['has_add_to_cart_inclusive'] = has_add_to_cart
         
         # Count purchases with checkout or add-to-cart
         if has_checkout:
@@ -488,10 +588,13 @@ def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Opt
     is_mps = device.type == 'mps'
     mps_memory_optimization = is_mps
     
-    # Create a progress bar that updates less frequently
+    # Create a progress bar with stable display settings
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}", 
-                      mininterval=10.0,  # Update at most every 10 seconds
-                      miniters=1000)      # Update after at least 1000 iterations
+                      mininterval=1.0,   # Update at most every 1 second
+                      miniters=10,       # Update after at least 10 iterations
+                      ncols=100,         # Fixed width to prevent terminal wrapping
+                      dynamic_ncols=False, # Disable dynamic width detection
+                      leave=True)        # Keep progress bar after completion
     
     optimizer.zero_grad()
     
@@ -576,6 +679,9 @@ def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Opt
         
         # Step optimizer after accumulation
         if (batch_idx + 1) % accumulation_steps == 0:
+            # Apply gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             if use_amp:
                 scaler.step(optimizer)
                 scaler.update()
@@ -601,6 +707,9 @@ def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Opt
     
     # Handle remaining gradients
     if (batch_idx + 1) % accumulation_steps != 0:
+        # Apply gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         if use_amp:
             scaler.step(optimizer)
             scaler.update()
@@ -622,17 +731,21 @@ def calculate_batch_metrics(predictions: torch.Tensor, targets: torch.Tensor,
                           has_checkout: Optional[torch.Tensor] = None,
                           has_add_to_cart: Optional[torch.Tensor] = None,
                           purchase_intent: Optional[torch.Tensor] = None,
-                          k_values: List[int] = [5, 10, 20]) -> Dict[str, Any]:
+                          k_values: List[int] = [5, 10, 20],
+                          has_checkout_inclusive: Optional[torch.Tensor] = None,
+                          has_add_to_cart_inclusive: Optional[torch.Tensor] = None) -> Dict[str, Any]:
     """Calculate metrics for a single batch efficiently with support for multiple event types
     
     Args:
         predictions: Predicted scores for each package
         targets: Target package indices
         is_purchase: Boolean tensor indicating purchase samples
-        has_checkout: Boolean tensor indicating checkout samples
-        has_add_to_cart: Boolean tensor indicating add-to-cart samples
+        has_checkout: Boolean tensor indicating checkout samples (hierarchical)
+        has_add_to_cart: Boolean tensor indicating add-to-cart samples (hierarchical)
         purchase_intent: Combined purchase + checkout intent (can be computed if not provided)
         k_values: List of k values for recall@k metrics
+        has_checkout_inclusive: Boolean tensor indicating checkout samples (inclusive for individual recall)
+        has_add_to_cart_inclusive: Boolean tensor indicating add-to-cart samples (inclusive for individual recall)
         
     Returns:
         Dictionary of metrics
@@ -687,19 +800,21 @@ def calculate_batch_metrics(predictions: torch.Tensor, targets: torch.Tensor,
                 purchase_in_top_k.float().sum() / is_purchase.sum().float()
             ).item() if is_purchase.sum() > 0 else 0.0
         
-        # Checkout-specific recall
-        if has_checkout is not None and has_checkout.sum() > 0:
-            checkout_in_top_k = in_top_k & has_checkout
+        # Checkout-specific recall - use inclusive flag if provided, otherwise fall back to hierarchical
+        checkout_flag = has_checkout_inclusive if has_checkout_inclusive is not None else has_checkout
+        if checkout_flag is not None and checkout_flag.sum() > 0:
+            checkout_in_top_k = in_top_k & checkout_flag
             metrics[f'checkout_recall@k_{k}'] = (
-                checkout_in_top_k.float().sum() / has_checkout.sum().float()
-            ).item() if has_checkout.sum() > 0 else 0.0
+                checkout_in_top_k.float().sum() / checkout_flag.sum().float()
+            ).item() if checkout_flag.sum() > 0 else 0.0
         
-        # Add-to-cart-specific recall
-        if has_add_to_cart is not None and has_add_to_cart.sum() > 0:
-            add_to_cart_in_top_k = in_top_k & has_add_to_cart
+        # Add-to-cart-specific recall - use inclusive flag if provided, otherwise fall back to hierarchical
+        cart_flag = has_add_to_cart_inclusive if has_add_to_cart_inclusive is not None else has_add_to_cart
+        if cart_flag is not None and cart_flag.sum() > 0:
+            add_to_cart_in_top_k = in_top_k & cart_flag
             metrics[f'add_to_cart_recall@k_{k}'] = (
-                add_to_cart_in_top_k.float().sum() / has_add_to_cart.sum().float()
-            ).item() if has_add_to_cart.sum() > 0 else 0.0
+                add_to_cart_in_top_k.float().sum() / cart_flag.sum().float()
+            ).item() if cart_flag.sum() > 0 else 0.0
             
         # Intent (purchase + checkout) recall
         if purchase_intent is not None and purchase_intent.sum() > 0:
@@ -724,16 +839,18 @@ def calculate_batch_metrics(predictions: torch.Tensor, targets: torch.Tensor,
             ranks[is_purchase].mean().item() if is_purchase.sum() > 0 else 0.0
         )
     
-    # Calculate MRR for checkouts
-    if has_checkout is not None:
+    # Calculate MRR for checkouts - use inclusive flag if provided
+    checkout_flag = has_checkout_inclusive if has_checkout_inclusive is not None else has_checkout
+    if checkout_flag is not None:
         metrics['checkout_mrr'] = (
-            ranks[has_checkout].mean().item() if has_checkout.sum() > 0 else 0.0
+            ranks[checkout_flag].mean().item() if checkout_flag.sum() > 0 else 0.0
         )
     
-    # Calculate MRR for add-to-cart
-    if has_add_to_cart is not None:
+    # Calculate MRR for add-to-cart - use inclusive flag if provided
+    cart_flag = has_add_to_cart_inclusive if has_add_to_cart_inclusive is not None else has_add_to_cart
+    if cart_flag is not None:
         metrics['add_to_cart_mrr'] = (
-            ranks[has_add_to_cart].mean().item() if has_add_to_cart.sum() > 0 else 0.0
+            ranks[cart_flag].mean().item() if cart_flag.sum() > 0 else 0.0
         )
     
     # Calculate MRR for combined intent (purchase + checkout)
@@ -778,8 +895,11 @@ def evaluate(model: nn.Module, test_loader: DataLoader, device: torch.device,
         
         # Use smaller batches for evaluation on MPS to avoid OOM
         progress_bar = tqdm(test_loader, desc="Evaluating",
-                           mininterval=10.0,  # Update at most every 10 seconds
-                           miniters=1000)     # Update after at least 1000 iterations
+                           mininterval=1.0,   # Update at most every 1 second
+                           miniters=5,        # Update after at least 5 iterations
+                           ncols=80,          # Fixed width for evaluation
+                           dynamic_ncols=False, # Disable dynamic width detection
+                           leave=False)       # Don't keep evaluation progress bar
         
         for batch_idx, batch in enumerate(progress_bar):
             # Move batch to device
@@ -794,6 +914,9 @@ def evaluate(model: nn.Module, test_loader: DataLoader, device: torch.device,
             is_purchase = batch.get('is_purchase', None)
             has_checkout = batch.get('has_checkout', None)
             has_add_to_cart = batch.get('has_add_to_cart', None)
+            # Get inclusive flags for individual event recall calculations
+            has_checkout_inclusive = batch.get('has_checkout_inclusive', None)
+            has_add_to_cart_inclusive = batch.get('has_add_to_cart_inclusive', None)
             
             # Create combined purchase+checkout intent signal if we have both
             purchase_intent = None
@@ -803,14 +926,20 @@ def evaluate(model: nn.Module, test_loader: DataLoader, device: torch.device,
             # Calculate metrics per batch to save memory
             batch_metrics = calculate_batch_metrics(
                 predictions, targets, is_purchase, has_checkout, 
-                has_add_to_cart, purchase_intent, k_values
+                has_add_to_cart, purchase_intent, k_values,
+                has_checkout_inclusive, has_add_to_cart_inclusive
             )
             
             # Accumulate metrics
             batch_size = targets.size(0)
             batch_purchases = is_purchase.sum().item() if is_purchase is not None else 0
-            batch_checkouts = has_checkout.sum().item() if has_checkout is not None else 0
-            batch_add_to_carts = has_add_to_cart.sum().item() if has_add_to_cart is not None else 0
+            # Use inclusive flags for counting checkouts and add-to-carts
+            batch_checkouts = has_checkout_inclusive.sum().item() if has_checkout_inclusive is not None else (
+                has_checkout.sum().item() if has_checkout is not None else 0
+            )
+            batch_add_to_carts = has_add_to_cart_inclusive.sum().item() if has_add_to_cart_inclusive is not None else (
+                has_add_to_cart.sum().item() if has_add_to_cart is not None else 0
+            )
             batch_intents = purchase_intent.sum().item() if purchase_intent is not None else 0
             
             # Update counts
@@ -995,7 +1124,7 @@ def create_dataloaders(train_samples: List[Dict], test_samples: List[Dict],
             event_to_idx,
             max_short_term=10,
             max_long_term=20,
-            use_cache=True,
+            use_cache=False,  # Disable caching to avoid stale data issues
             prefetch_features=True  # Prefetch training features for speed
         )
     
@@ -1010,24 +1139,25 @@ def create_dataloaders(train_samples: List[Dict], test_samples: List[Dict],
             event_to_idx,
             max_short_term=10,
             max_long_term=20,
-            use_cache=True,
+            use_cache=False,  # Disable caching to avoid stale data issues
             prefetch_features=True  # Now prefetching test features too for speed
         )
     
     # Create weighted sampler for training if requested
     sampler = None
     if use_weighted_sampling:
-        # Calculate different event type counts
-        purchase_count = sum(1 for s in train_samples if s.get('is_purchase', False))
-        checkout_count = sum(1 for s in train_samples if not s.get('is_purchase', False) and s.get('has_checkout', False))
-        add_to_cart_count = sum(1 for s in train_samples if not s.get('is_purchase', False) and 
-                               not s.get('has_checkout', False) and s.get('has_add_to_cart', False))
+        # Calculate different event type counts (for debugging/logging if needed)
+        # purchase_count = sum(1 for s in train_samples if s.get('is_purchase', False))
+        # checkout_count = sum(1 for s in train_samples if not s.get('is_purchase', False) and s.get('has_checkout', False))
+        # add_to_cart_count = sum(1 for s in train_samples if not s.get('is_purchase', False) and 
+        #                        not s.get('has_checkout', False) and s.get('has_add_to_cart', False))
         
         # Set weights for different sample types
+        # Using same ratios as metric weights: 1.0:0.6:0.2:0.05 = 20:12:4:1
         purchase_boost = 20.0    # Very high weight for actual purchases
-        checkout_boost = 8.0     # Medium-high weight for checkouts
-        add_to_cart_boost = 3.0  # Medium weight for add-to-cart events
-        regular_weight = 1.0     # Base weight for regular browsing
+        checkout_boost = 12.0    # High weight for checkouts (60% of purchase)
+        add_to_cart_boost = 4.0  # Medium weight for add-to-cart events (20% of purchase)
+        regular_weight = 1.0     # Base weight for regular browsing (5% of purchase)
         
         # Calculate weights for each sample
         sample_weights = []
@@ -1069,6 +1199,58 @@ def create_dataloaders(train_samples: List[Dict], test_samples: List[Dict],
             replacement=True
         )
     
+    # Custom collate function to properly structure batch with event flags
+    def custom_collate_fn(samples):
+        """Custom collate function that extracts event flags to top level"""
+        # Stack all the nested dictionaries
+        batch = {}
+        
+        # Extract scalar values and tensors
+        # batch_size = len(samples)  # Currently unused, kept for potential future use
+        
+        # User-level data
+        batch['user_id'] = torch.stack([s['user_id'] for s in samples])
+        batch['has_short_term'] = torch.stack([s['has_short_term'] for s in samples])
+        
+        # IMPORTANT: Extract event flags to top level for metrics
+        batch['is_purchase'] = torch.stack([s['is_purchase'] for s in samples])
+        batch['has_checkout'] = torch.stack([s.get('has_checkout', torch.tensor(False)) for s in samples])
+        batch['has_add_to_cart'] = torch.stack([s.get('has_add_to_cart', torch.tensor(False)) for s in samples])
+        batch['has_checkout_inclusive'] = torch.stack([s.get('has_checkout_inclusive', torch.tensor(False)) for s in samples])
+        batch['has_add_to_cart_inclusive'] = torch.stack([s.get('has_add_to_cart_inclusive', torch.tensor(False)) for s in samples])
+        
+        # Other flags
+        batch['is_cold_start'] = torch.stack([s.get('is_cold_start', torch.tensor(False)) for s in samples])
+        
+        # Nested dictionaries for sequences
+        batch['short_term'] = {}
+        batch['long_term'] = {}
+        batch['purchased'] = {}
+        
+        # Short-term data
+        for key in ['package_ids', 'event_types', 'title_embeddings', 'coordinates', 
+                    'country_ids', 'category_ids', 'theme_ids', 'prices', 'timestamps']:
+            if key in samples[0]['short_term'] and samples[0]['short_term'][key] is not None:
+                batch['short_term'][key] = torch.stack([s['short_term'][key] for s in samples])
+        
+        # Long-term data
+        for key in ['package_ids', 'event_types', 'title_embeddings', 'coordinates',
+                    'country_ids', 'category_ids', 'theme_ids', 'prices', 'timestamps']:
+            if key in samples[0]['long_term'] and samples[0]['long_term'][key] is not None:
+                batch['long_term'][key] = torch.stack([s['long_term'][key] for s in samples])
+        
+        # Purchased data
+        for key in ['package_ids', 'title_embeddings', 'coordinates',
+                    'country_ids', 'category_ids', 'theme_ids', 'prices', 'timestamps']:
+            if key in samples[0]['purchased'] and samples[0]['purchased'][key] is not None:
+                if key == 'package_ids':
+                    # package_ids is a scalar for purchased
+                    batch['purchased'][key] = torch.stack([s['purchased'][key] for s in samples])
+                else:
+                    batch['purchased'][key] = torch.stack([s['purchased'][key] for s in samples])
+        
+        return batch
+
     # Create dataloaders with optimized settings
     train_loader = DataLoader(
         train_dataset,
@@ -1080,7 +1262,8 @@ def create_dataloaders(train_samples: List[Dict], test_samples: List[Dict],
         persistent_workers=(num_workers > 0),
         prefetch_factor=3 if num_workers > 0 else None,  # Increased prefetch factor
         drop_last=True,  # Drop last incomplete batch for stable training
-        generator=torch.Generator().manual_seed(42)  # Consistent shuffling
+        generator=torch.Generator().manual_seed(42),  # Consistent shuffling
+        collate_fn=custom_collate_fn  # Use custom collate function
     )
     
     test_loader = DataLoader(
@@ -1090,7 +1273,8 @@ def create_dataloaders(train_samples: List[Dict], test_samples: List[Dict],
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available() or torch.backends.mps.is_available(),
         persistent_workers=(num_workers > 0),
-        prefetch_factor=3 if num_workers > 0 else None  # Increased prefetch factor
+        prefetch_factor=3 if num_workers > 0 else None,  # Increased prefetch factor
+        collate_fn=custom_collate_fn  # Use custom collate function
     )
     
     return train_loader, test_loader

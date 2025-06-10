@@ -29,7 +29,7 @@ class PackageProcessor:
     - Categorical features (country, city, category, theme)
     - Numerical features (price)
     """
-    def __init__(self, data_path=None, cache_dir='data/cache', 
+    def __init__(self, feed_data_path='data/feed.parquet', cache_dir='data/cache', 
                  load_coordinates=True, 
                  load_embeddings=True,
                  api_key=None,
@@ -39,14 +39,15 @@ class PackageProcessor:
         Initialize PackageProcessor
         
         Args:
-            data_path (str): Path to the package data file
-            cache_dir (str): Directory for caching processed data
+            feed_data_path (str): Path to the package data file (defaults to 'data/feed.parquet')
+            cache_dir (str): Directory for caching processed data (only llm_embeddings and geocoding are cached)
             load_coordinates (bool): Whether to load coordinates from geocoder cache
             load_embeddings (bool): Whether to generate title embeddings
             api_key (str): OpenAI API key for embeddings
             embedding_model (str): OpenAI embedding model to use
         """
-        self.data_path = data_path
+        self.feed_data_path = feed_data_path
+        self.data_path = feed_data_path  # Keep for backward compatibility
         self.cache_dir = cache_dir
         self.load_coordinates = load_coordinates
         self.load_embeddings = load_embeddings
@@ -102,25 +103,14 @@ class PackageProcessor:
             self._load_coordinates_from_geocoder()
     
     def clear_cache(self):
-        """Clear all cached files in the cache directory related to package data"""
-        try:
-            cache_files = [
-                os.path.join(self.cache_dir, 'package_metadata.pkl'),
-                os.path.join(self.cache_dir, 'package_mappings.pkl'),
-                os.path.join(self.cache_dir, 'package_features.pkl')  # New cache for features
-            ]
-            
-            for file in cache_files:
-                if os.path.exists(file):
-                    os.remove(file)
-                    print(f"Removed cache file: {file}")
-            
-            print(f"Cleared package data cache")
-        except Exception as e:
-            print(f"Error clearing cache: {e}")
+        """Note: LLM embeddings and geocoding caches are preserved"""
+        print("Package processor no longer uses general caching.")
+        print("LLM embeddings and geocoding caches are preserved in:")
+        print(f"  - {os.path.join(self.cache_dir, 'llm_embeddings')}")
+        print(f"  - {os.path.join(self.cache_dir, 'geocoding')}")
     
     def _load_coordinates_from_geocoder(self):
-        """Load coordinates from geocoder_dutch.py cache - FIXED VERSION"""
+        """Load coordinates from geocoder_dutch.py cache and generate missing ones"""
         geocoder_cache_file = os.path.join(self.cache_dir, 'geocoding', 'main_id_coordinates.pkl')
         
         if os.path.exists(geocoder_cache_file):
@@ -134,9 +124,87 @@ class PackageProcessor:
                 print(f"Error loading geocoder coordinates: {e}")
                 self.package_coordinates = {}
         else:
-            print("No geocoder cache found. Run geocoder_dutch.py first to geocode packages.")
+            print("No geocoder cache found. Initializing empty coordinates.")
             self.package_coordinates = {}
+            
+        # After loading/processing packages, check for missing coordinates
+        # This will be called again in _process_package_metadata to geocode missing ones
 
+    def _geocode_missing_packages(self, missing_packages):
+        """Geocode packages that don't have coordinates"""
+        try:
+            # Use the already imported GoogleDutchGeocoder
+            google_api_key = os.environ.get('GOOGLE_MAPS_API_KEY')
+            if not google_api_key:
+                print("Warning: GOOGLE_MAPS_API_KEY environment variable not set. Skipping geocoding.")
+                return
+                
+            geocoder = GoogleDutchGeocoder(
+                google_api_key=google_api_key,
+                cache_dir=os.path.join(self.cache_dir, 'geocoding')
+            )
+            
+            # Prepare data for geocoding
+            geocode_data = []
+            for main_id_str, metadata in missing_packages:
+                geocode_data.append({
+                    'main_id': main_id_str,
+                    'city': metadata.get('city', ''),
+                    'country': metadata.get('country', '')
+                })
+            
+            # Process in batches
+            batch_size = 100
+            geocoded_count = 0
+            
+            for i in range(0, len(geocode_data), batch_size):
+                batch = geocode_data[i:i+batch_size]
+                
+                for item in batch:
+                    main_id_str = item['main_id']
+                    city = item['city']
+                    country = item['country']
+                    
+                    # Try to geocode
+                    coords = geocoder.geocode_location(city, country)
+                    
+                    if coords is not None:
+                        # coords is a tuple (lat, lng)
+                        lat, lng = coords
+                        
+                        # Create coordinate dict
+                        coord_dict = {
+                            'latitude': lat,
+                            'longitude': lng
+                        }
+                        
+                        # Update package coordinates
+                        self.package_coordinates[main_id_str] = coord_dict
+                        
+                        # Update metadata
+                        self.package_metadata[main_id_str]['latitude'] = lat
+                        self.package_metadata[main_id_str]['longitude'] = lng
+                        
+                        geocoded_count += 1
+                
+                print(f"Geocoded batch {i//batch_size + 1}/{(len(geocode_data) + batch_size - 1)//batch_size}")
+            
+            print(f"Successfully geocoded {geocoded_count} out of {len(missing_packages)} packages")
+            
+            # Save updated coordinates to cache
+            if geocoded_count > 0:
+                geocoder_cache_file = os.path.join(self.cache_dir, 'geocoding', 'main_id_coordinates.pkl')
+                os.makedirs(os.path.dirname(geocoder_cache_file), exist_ok=True)
+                
+                with open(geocoder_cache_file, 'wb') as f:
+                    pickle.dump(self.package_coordinates, f)
+                print(f"Updated geocoder cache with new coordinates")
+                
+        except ImportError:
+            print("Warning: Could not import GeocoderDutch. Skipping coordinate generation.")
+        except Exception as e:
+            print(f"Error geocoding missing packages: {e}")
+    
     def _generate_embeddings(self):
         """Generate embeddings for all package titles using LLMPackageEncoder"""
         if not self.load_embeddings or not self.llm_encoder:
@@ -218,107 +286,34 @@ class PackageProcessor:
         else:
             print("All packages now have embeddings!")
     
-    def load_data(self, use_cache=True):
-        """Load package data with caching for efficiency - FIXED VERSION"""
-        cache_file = os.path.join(self.cache_dir, 'package_metadata.pkl')
-        
-        # Check and load cache
-        if use_cache and os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'rb') as f:
-                    cache_data = pickle.load(f)
-                    cached_data_path = cache_data.get('data_path')
-                    
-                    if cached_data_path != self.data_path:
-                        print(f"Dataset path changed. Clearing previous cache.")
-                        self.clear_cache()
-                    else:
-                        # Load cached data
-                        self.package_metadata = cache_data['package_metadata']
-                        self.df = cache_data.get('df')
-                        
-                        # IMPORTANT: Load coordinates if requested and add to metadata
-                        if self.load_coordinates:
-                            self._load_coordinates_from_geocoder()
-                            # Add coordinates to metadata if not already there
-                            for main_id_str in self.package_metadata:
-                                if main_id_str in self.package_coordinates:
-                                    coord_data = self.package_coordinates[main_id_str]
-                                    if 'latitude' not in self.package_metadata[main_id_str]:
-                                        self.package_metadata[main_id_str]['latitude'] = coord_data.get('latitude')
-                                        self.package_metadata[main_id_str]['longitude'] = coord_data.get('longitude')
-                        
-                        # IMPORTANT: Load/generate embeddings if requested and add to metadata
-                        if self.load_embeddings:
-                            # First try loading from LLM embedding cache directly
-                            llm_cache_path = os.path.join(self.cache_dir, 'llm_embeddings', f'{self.embedding_model}_cache.json')
-                            if os.path.exists(llm_cache_path):
-                                try:
-                                    print(f"Loading embeddings directly from {llm_cache_path}")
-                                    with open(llm_cache_path, 'r') as f:
-                                        embedding_cache = json.load(f)
-                                        for main_id_str, embedding in embedding_cache.items():
-                                            if isinstance(embedding, list):
-                                                self.package_embeddings[main_id_str] = np.array(embedding)
-                                            else:
-                                                self.package_embeddings[main_id_str] = embedding
-                                    print(f"Loaded {len(self.package_embeddings)} embeddings directly from cache")
-                                except Exception as e:
-                                    print(f"Error loading embeddings directly: {e}, falling back to normal method")
-                                    self._generate_embeddings()
-                            else:
-                                self._generate_embeddings()
-                                
-                            # Add embeddings to metadata if not already there
-                            for main_id_str in self.package_metadata:
-                                if main_id_str in self.package_embeddings:
-                                    if 'title_embedding' not in self.package_metadata[main_id_str]:
-                                        self.package_metadata[main_id_str]['title_embedding'] = self.package_embeddings[main_id_str]
-                        
-                        print(f"Loaded metadata for {len(self.package_metadata)} packages from cache")
-                        
-                        # Report statistics
-                        with_coords = sum(1 for m in self.package_metadata.values() 
-                                        if 'latitude' in m and m['latitude'] is not None)
-                        with_embeddings = sum(1 for m in self.package_metadata.values() 
-                                            if 'title_embedding' in m and m['title_embedding'] is not None)
-                        print(f"Packages with coordinates: {with_coords} ({with_coords/len(self.package_metadata)*100:.1f}%)")
-                        print(f"Packages with embeddings: {with_embeddings} ({with_embeddings/len(self.package_metadata)*100:.1f}%)")
-                        
-                        return
-            except Exception as e:
-                print(f"Cache loading error: {e}. Clearing cache and reloading.")
-                self.clear_cache()
-        
+    def load_data(self, feed_data_path=None):
+        """Load package data directly without general caching (llm_embeddings and geocoding are still cached)"""
+        # Allow overriding the feed data path
+        if feed_data_path:
+            self.feed_data_path = feed_data_path
+            self.data_path = feed_data_path  # Backward compatibility
+            
         # Load data from source
-        if self.data_path:
-            print(f"Loading package data from {self.data_path}")
+        if self.feed_data_path:
+            print(f"Loading package data from {self.feed_data_path}")
             
             # Load file based on extension
             try:
-                if self.data_path.endswith('.parquet'):
-                    self.df = pd.read_parquet(self.data_path)
+                if self.feed_data_path.endswith('.parquet'):
+                    self.df = pd.read_parquet(self.feed_data_path)
                 else:
-                    self.df = pd.read_csv(self.data_path)
+                    self.df = pd.read_csv(self.feed_data_path)
                 print(f"Loaded {len(self.df)} packages")
             except Exception as e:
                 print(f"Error loading file: {e}")
                 return
             
-            # Process package metadata
+            # Process package metadata (this will handle coordinates and embeddings)
             self._process_package_metadata()
             
-            # Save to cache
-            cache_data = {
-                'package_metadata': self.package_metadata,
-                'df': self.df,
-                'data_path': self.data_path
-            }
-            
-            with open(cache_file, 'wb') as f:
-                pickle.dump(cache_data, f)
-            
-            print(f"Saved processed data to cache")
+            print(f"Package data loading complete. No general caching applied.")
+        else:
+            print("Error: No feed data path provided")
 
 
     def _process_package_metadata(self):
@@ -437,11 +432,7 @@ class PackageProcessor:
         all_prices = [p for prices in category_prices.values() for p in prices]
         overall_median = np.median(all_prices) if all_prices else 100.0  # Default fallback
         
-        # Extract price from theme for those with numeric values (e.g., "75 euro deals")
-        extracted_count = 0
-        import re
-        # Enhanced price pattern to capture more variations - require at least 2 digits
-        price_pattern = r'(\d{2,}[.,]?\d*)\s*(euro|eur|€|dollar|\$|pound|£)'
+        # Note: Price extraction from theme names removed as it wasn't being used
         
         # Second pass - fix zero prices
         for main_id_str, metadata in self.package_metadata.items():
@@ -526,9 +517,6 @@ class PackageProcessor:
         print(f"  Saudi packages: {saudi_packages} total, {high_price_saudi} with price > €{saudi_price_max}")
         print(f"  All packages now have valid prices")
         
-        # Add price range statistics 
-        all_final_prices = [m['min_price'] for m in self.package_metadata.values()]
-        
         # Report on price distribution
         all_prices = [m['min_price'] for m in self.package_metadata.values()]
         price_percentiles = [np.percentile(all_prices, p) for p in [5, 25, 50, 75, 95]]
@@ -551,6 +539,18 @@ class PackageProcessor:
                             else:
                                 self.package_embeddings[main_id_str] = embedding
                     print(f"Loaded {len(self.package_embeddings)} embeddings directly from cache")
+                    
+                    # IMPORTANT: Check for missing embeddings and generate them
+                    missing_packages = []
+                    for main_id_str in self.package_metadata:
+                        if main_id_str not in self.package_embeddings:
+                            missing_packages.append(main_id_str)
+                    
+                    if missing_packages:
+                        print(f"Found {len(missing_packages)} packages without embeddings")
+                        print(f"Generating embeddings for missing packages...")
+                        self._generate_embeddings()  # This will only generate for missing ones
+                    
                 except Exception as e:
                     print(f"Error loading embeddings directly: {e}, falling back to normal method")
                     self._generate_embeddings()
@@ -574,6 +574,18 @@ class PackageProcessor:
         with_embeddings = sum(1 for m in self.package_metadata.values() 
                             if 'title_embedding' in m and m['title_embedding'] is not None)
         print(f"Packages with embeddings: {with_embeddings} ({with_embeddings/len(self.package_metadata)*100:.1f}%)")
+        
+        # IMPORTANT: Geocode missing packages if any
+        if self.load_coordinates:
+            missing_coords = []
+            for main_id_str, metadata in self.package_metadata.items():
+                if 'latitude' not in metadata or metadata.get('latitude') is None:
+                    missing_coords.append((main_id_str, metadata))
+            
+            if missing_coords:
+                print(f"\nFound {len(missing_coords)} packages without coordinates")
+                print("Attempting to geocode missing packages...")
+                self._geocode_missing_packages(missing_coords)
         
     
     
@@ -738,19 +750,13 @@ class PackageProcessor:
             for source, count in sorted(source_counts.items(), key=lambda x: x[1], reverse=True):
                 print(f"    {source}: {count} ({count/len(prices)*100:.1f}%)")
     
-    def prepare_package_tensors(self, use_cache=True) -> Dict[str, torch.Tensor]:
+    def prepare_package_tensors(self) -> Dict[str, torch.Tensor]:
         """
         Prepare all package features as tensors for efficient model usage
         
         Returns:
             Dictionary of tensors for all packages
         """
-        cache_file = os.path.join(self.cache_dir, 'package_features.pkl')
-        
-        if use_cache and os.path.exists(cache_file):
-            print("Loading cached package feature tensors")
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
         
         print("Preparing package feature tensors...")
         
@@ -916,31 +922,16 @@ class PackageProcessor:
             'prices': torch.tensor(prices, dtype=torch.float)
         }
         
-        # Save to cache
-        with open(cache_file, 'wb') as f:
-            pickle.dump(feature_tensors, f)
-        
         print(f"Prepared feature tensors for {num_packages} packages")
         return feature_tensors
     
-    def create_mappings(self, use_cache=True):
+    def create_mappings(self):
         """Create mappings from package attributes to indices"""
-        cache_file = os.path.join(self.cache_dir, 'package_mappings.pkl')
-        
-        if use_cache and os.path.exists(cache_file):
-            print(f"Loading package attribute mappings from cache")
-            with open(cache_file, 'rb') as f:
-                mappings = pickle.load(f)
-                self.country_to_idx = mappings['country_to_idx']
-                self.category_to_idx = mappings['category_to_idx']
-                self.theme_to_idx = mappings['theme_to_idx']
-                self.city_to_idx = mappings.get('city_to_idx', {})
-            return
         
         print("Creating package attribute mappings...")
         
         if not self.package_metadata:
-            self.load_data(use_cache=use_cache)
+            self.load_data()
         
         # Extract unique values
         cities = set()
@@ -974,17 +965,6 @@ class PackageProcessor:
               f"{len(self.city_to_idx)} cities, "
               f"{len(self.category_to_idx)} categories, and "
               f"{len(self.theme_to_idx)} themes")
-        
-        # Save mappings
-        mappings = {
-            'country_to_idx': self.country_to_idx,
-            'city_to_idx': self.city_to_idx,
-            'category_to_idx': self.category_to_idx,
-            'theme_to_idx': self.theme_to_idx
-        }
-        
-        with open(cache_file, 'wb') as f:
-            pickle.dump(mappings, f)
 
     def has_embeddings(self) -> bool:
         """Check if embeddings are loaded"""
@@ -1191,7 +1171,7 @@ class TravelPackageDataset(Dataset):
         batch_size = len(batch_samples)
         
         # Pre-allocate arrays
-        user_ids = np.zeros(batch_size, dtype=np.int64)
+        user_ids = np.zeros(batch_size, dtype=np.int32)  # Changed from int64 to int32 to match tensor type
         has_short_term = np.zeros(batch_size, dtype=bool)
         is_purchase = np.zeros(batch_size, dtype=bool)
         
@@ -1204,29 +1184,29 @@ class TravelPackageDataset(Dataset):
         has_checkout_inclusive = np.zeros(batch_size, dtype=bool)
         has_add_to_cart_inclusive = np.zeros(batch_size, dtype=bool)
         
-        # Short-term arrays
-        st_packages = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
-        st_events = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
-        st_countries = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
-        st_categories = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
-        st_themes = np.zeros((batch_size, self.max_short_term), dtype=np.int64)
+        # Short-term arrays - use int32 for indices
+        st_packages = np.zeros((batch_size, self.max_short_term), dtype=np.int32)
+        st_events = np.zeros((batch_size, self.max_short_term), dtype=np.int32)
+        st_countries = np.zeros((batch_size, self.max_short_term), dtype=np.int32)
+        st_categories = np.zeros((batch_size, self.max_short_term), dtype=np.int32)
+        st_themes = np.zeros((batch_size, self.max_short_term), dtype=np.int32)
         st_prices = np.zeros((batch_size, self.max_short_term), dtype=np.float32)
         st_timestamps = np.zeros((batch_size, self.max_short_term), dtype=np.float32)
         
-        # Long-term arrays (similar)
-        lt_packages = np.zeros((batch_size, self.max_long_term), dtype=np.int64)
-        lt_events = np.zeros((batch_size, self.max_long_term), dtype=np.int64)
-        lt_countries = np.zeros((batch_size, self.max_long_term), dtype=np.int64)
-        lt_categories = np.zeros((batch_size, self.max_long_term), dtype=np.int64)
-        lt_themes = np.zeros((batch_size, self.max_long_term), dtype=np.int64)
+        # Long-term arrays - use int32 for indices
+        lt_packages = np.zeros((batch_size, self.max_long_term), dtype=np.int32)
+        lt_events = np.zeros((batch_size, self.max_long_term), dtype=np.int32)
+        lt_countries = np.zeros((batch_size, self.max_long_term), dtype=np.int32)
+        lt_categories = np.zeros((batch_size, self.max_long_term), dtype=np.int32)
+        lt_themes = np.zeros((batch_size, self.max_long_term), dtype=np.int32)
         lt_prices = np.zeros((batch_size, self.max_long_term), dtype=np.float32)
         lt_timestamps = np.zeros((batch_size, self.max_long_term), dtype=np.float32)
         
-        # Purchased arrays
-        purchased_packages = np.zeros(batch_size, dtype=np.int64)
-        purchased_countries = np.zeros(batch_size, dtype=np.int64)
-        purchased_categories = np.zeros(batch_size, dtype=np.int64)
-        purchased_themes = np.zeros(batch_size, dtype=np.int64)
+        # Purchased arrays - use int32 to avoid overflow issues
+        purchased_packages = np.zeros(batch_size, dtype=np.int32)
+        purchased_countries = np.zeros(batch_size, dtype=np.int32)
+        purchased_categories = np.zeros(batch_size, dtype=np.int32)
+        purchased_themes = np.zeros(batch_size, dtype=np.int32)
         purchased_prices = np.zeros(batch_size, dtype=np.float32)
         purchased_timestamps = np.zeros(batch_size, dtype=np.float32)
         
@@ -1236,7 +1216,16 @@ class TravelPackageDataset(Dataset):
         # Process samples
         for i, sample in enumerate(batch_samples):
             # User info
-            user_ids[i] = self.user_to_idx.get(sample['user_id'], 0)
+            user_id = sample['user_id']
+            mapped_id = self.user_to_idx.get(user_id, -1)
+            if mapped_id == -1:
+                if not hasattr(self, '_unmapped_users_logged'):
+                    self._unmapped_users_logged = set()
+                if user_id not in self._unmapped_users_logged:
+                    print(f"WARNING: Unmapped user_id: {user_id}")
+                    self._unmapped_users_logged.add(user_id)
+                mapped_id = 0  # Use padding index
+            user_ids[i] = mapped_id
             has_short_term[i] = len(sample.get('short_term_packages', [])) > 0
             is_purchase[i] = sample.get('is_purchase', False)
             
@@ -1304,7 +1293,7 @@ class TravelPackageDataset(Dataset):
         
         # Convert to tensors
         return {
-            'user_ids': torch.from_numpy(user_ids),
+            'user_ids': torch.from_numpy(user_ids.astype(np.int32)),  # Ensure int32 for compatibility
             'has_short_term': torch.from_numpy(has_short_term),
             'is_purchase': torch.from_numpy(is_purchase),
             'has_checkout': torch.from_numpy(has_checkout),
@@ -1351,6 +1340,11 @@ class TravelPackageDataset(Dataset):
         """Prefetch features for frequently accessed packages"""
         print("Prefetching common package features...")
         
+        # Safety check: ensure short_term_packages exists
+        if not hasattr(self, 'short_term_packages'):
+            print("Warning: short_term_packages not found, skipping prefetch")
+            return
+        
         # Get most common packages
         package_counts = Counter()
         for i in range(len(self.short_term_packages)):
@@ -1369,6 +1363,11 @@ class TravelPackageDataset(Dataset):
         """Optimized getitem with minimal computation, including temporal information"""
         # Use pre-computed indices
         user_id = self.user_ids[idx]
+        
+        # Debug check for invalid user IDs
+        if hasattr(self, '_debug_user_ids') and idx < 10:  # Only debug first 10
+            if user_id < 0 or user_id > 1000000:  # Suspicious values
+                print(f"[DEBUG] Suspicious user_id at idx {idx}: {user_id} (type: {type(user_id)}, item: {user_id.item() if hasattr(user_id, 'item') else user_id})")
         
         # Build sample efficiently
         sample = {

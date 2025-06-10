@@ -4,10 +4,11 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 
 class ViewLevelAttention(nn.Module):
-    """Enhanced multi-head attention-based view fusion with geographic and price priority"""
-    def __init__(self, hidden_dim: int):
+    """Enhanced multi-head attention-based view fusion with personalized attention using user embeddings"""
+    def __init__(self, hidden_dim: int, user_embedding_dim: int):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.user_embedding_dim = user_embedding_dim
         
         # Multi-head attention for view fusion - increased number of heads
         self.view_attention = nn.MultiheadAttention(
@@ -17,17 +18,22 @@ class ViewLevelAttention(nn.Module):
             batch_first=True
         )
         
-        # View importance scoring - learns which views matter most
+        # Personalized view importance scoring - incorporates user preferences
         self.view_importance = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.LayerNorm(64),  # Added normalization for stable learning
+            nn.Linear(hidden_dim + user_embedding_dim, 128),  # Increased capacity for user info
+            nn.LayerNorm(128),  # Added normalization for stable learning
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, 1)
         )
         
         # Simplified view-wise scaling factors 
-        # Initialize all views with equal importance to prevent bias
-        self.view_scalars = nn.Parameter(torch.ones(6))  # Equal weights for all 6 views
+        # Initialize with different weights to encourage learning diverse patterns
+        # [title, coordinates, country, category/theme, price, time]
+        initial_weights = torch.tensor([1.2, 1.0, 0.8, 0.8, 1.0, 0.6])
+        self.view_scalars = nn.Parameter(initial_weights)  # Different initial weights for views
         
         # Detect number of views at runtime
         self.num_expected_views = 6  # Updated for 6 views with price
@@ -44,13 +50,18 @@ class ViewLevelAttention(nn.Module):
         # Layer normalization for stability
         self.layer_norm = nn.LayerNorm(hidden_dim)
         
-    def forward(self, views: list) -> torch.Tensor:
-        """Fuse views with adaptive attention and importance weighting"""
+    def forward(self, views: list, user_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Fuse views with personalized attention based on user preferences
+        
+        Args:
+            views: List of view tensors [batch_size, seq_len, hidden_dim]
+            user_embedding: User preference vector [batch_size, user_embedding_dim]
+        """
         # Process all views to ensure same dimensionality
         processed_views = []
         
-        # Number of views at runtime
-        num_views = len(views)
+        # Get sequence length for processing
+        seq_len = views[0].size(1) if views[0].dim() > 2 else 1
         
         for view_idx, view in enumerate(views):
             # Handle cases where the view has different dimensions than hidden_dim
@@ -72,10 +83,28 @@ class ViewLevelAttention(nn.Module):
                 
             processed_views.append(view)
         
-        # Calculate importance scores for each view
+        # Calculate personalized importance scores for each view
         view_scores = []
+        
+        # Prepare user embedding for attention calculation
+        if user_embedding is not None:
+            # Expand user embedding to match sequence length
+            if seq_len > 1:
+                user_emb_expanded = user_embedding.unsqueeze(1).expand(-1, seq_len, -1)
+            else:
+                user_emb_expanded = user_embedding.unsqueeze(1)
+        
         for view in processed_views:
-            score = self.view_importance(view)  # Batch x Seq x 1
+            if user_embedding is not None:
+                # Concatenate view representation with user embedding for personalized attention
+                view_with_user = torch.cat([view, user_emb_expanded], dim=-1)
+                score = self.view_importance(view_with_user)  # Batch x Seq x 1
+            else:
+                # Fallback to non-personalized attention if no user embedding provided
+                # Pad with zeros to match expected input size
+                padding = torch.zeros(*view.shape[:-1], self.user_embedding_dim, device=view.device)
+                view_with_padding = torch.cat([view, padding], dim=-1)
+                score = self.view_importance(view_with_padding)
             view_scores.append(score)
         
         # Softmax across views to get attention distribution
@@ -198,9 +227,12 @@ class PackageEncoder(nn.Module):
             nn.Linear(64, config.hidden_dim)
         )
         
-        # Add event attention layer - learns to focus on important event types
+        # Add personalized event attention layer - learns to focus on important event types based on user
         self.event_attention = nn.Sequential(
-            nn.Linear(32, 32),
+            nn.Linear(32 + config.user_embedding_dim, 64),  # Include user embedding
+            nn.Tanh(),
+            nn.Dropout(config.dropout),
+            nn.Linear(64, 32),
             nn.Tanh(),
             nn.Linear(32, 1)
         )
@@ -215,11 +247,16 @@ class PackageEncoder(nn.Module):
             nn.Linear(64, config.hidden_dim)
         )
         
-        # View-level attention - updated to include price view
-        self.view_attention = ViewLevelAttention(config.hidden_dim)
+        # View-level attention - updated to include price view and personalized attention
+        self.view_attention = ViewLevelAttention(config.hidden_dim, config.user_embedding_dim)
     
-    def forward(self, batch_data: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Forward pass with event awareness, temporal information, and price sensitivity"""
+    def forward(self, batch_data: Dict[str, torch.Tensor], user_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass with event awareness, temporal information, and personalized attention
+        
+        Args:
+            batch_data: Dictionary containing package features
+            user_embedding: Optional user embeddings for personalized attention
+        """
         # Handle dimensions
         if len(batch_data['title_embeddings'].shape) == 2:
             # Single package case
@@ -347,20 +384,36 @@ class PackageEncoder(nn.Module):
         cat_combined = torch.cat([category_emb, theme_emb], dim=-1)
         cat_repr = self.category_encoder(cat_combined.view(-1, cat_combined.size(-1))).view(batch_size, seq_len, -1)
         
-        # Process events with attention mechanism to weight different event types 
-        # using size-aware implementation that works with cached data
+        # Process events with personalized attention mechanism to weight different event types 
+        # based on user preferences
         try:
-            # Try to apply attention mechanism
-            event_attn_scores = self.event_attention(event_emb)  # [batch_size, seq_len, 1]
+            # Apply personalized attention mechanism
+            if user_embedding is not None:
+                # Expand user embedding to match sequence length
+                if seq_len > 1:
+                    user_emb_for_event = user_embedding.unsqueeze(1).expand(-1, seq_len, -1)
+                else:
+                    user_emb_for_event = user_embedding.unsqueeze(1)
+                
+                # Concatenate event embedding with user embedding
+                event_with_user = torch.cat([event_emb, user_emb_for_event], dim=-1)
+                event_attn_scores = self.event_attention(event_with_user)  # [batch_size, seq_len, 1]
+            else:
+                # Fallback to non-personalized attention
+                padding = torch.zeros(*event_emb.shape[:-1], self.event_attention[0].in_features - 32, 
+                                    device=event_emb.device)
+                event_with_padding = torch.cat([event_emb, padding], dim=-1)
+                event_attn_scores = self.event_attention(event_with_padding)
+            
             event_attn_weights = F.softmax(event_attn_scores, dim=1)
             event_weighted = event_emb * event_attn_weights  # Apply attention weights
-        except Exception:
+        except Exception as e:
             # Fallback if dimensions don't match
+            print(f"Warning: Event attention failed with error: {e}")
             event_weighted = event_emb  # Skip attention for incompatible dimensions
         
         # Enhanced event representation with dedicated encoder
         event_encoded = self.event_encoder(event_weighted)
-        event_repr = self.event_projection(event_emb)
         
         # Combine event information - now with stronger event type semantics
         # Early fusion with title representation
@@ -379,9 +432,10 @@ class PackageEncoder(nn.Module):
             price_repr,            # Price-based recommendations (view index 4 - weight 1.2)
             time_repr              # Temporal information (view index 5 - weight 0.6)
         ]
-        unified_repr = self.view_attention(views)
+        unified_repr = self.view_attention(views, user_embedding)
         
-        return unified_repr.squeeze(1) if seq_len == 1 else unified_repr
+        # Always return 3D tensor to maintain consistency
+        return unified_repr
 
 
 class PackageLevelAttention(nn.Module):
@@ -447,6 +501,11 @@ class PackageLevelAttention(nn.Module):
         attention_scores = torch.matmul(query, key.transpose(-2, -1)) / self.scale_factor  
         # [batch_size, num_heads, 1, seq_len]
         
+        # Check for numerical issues in attention scores
+        if torch.isnan(attention_scores).any() or torch.isinf(attention_scores).any():
+            # Clamp values to prevent overflow
+            attention_scores = torch.clamp(attention_scores, min=-100, max=100)
+        
         # Apply temporal bias if timestamps are provided
         if timestamps is not None:
             # Ensure timestamps are floating point and valid
@@ -476,12 +535,31 @@ class PackageLevelAttention(nn.Module):
         
         # Apply mask if provided
         if mask is not None:
+            # Check for sequences that are entirely padded
+            mask_sum = mask.sum(dim=1)  # Count valid positions per batch
+            
             # Expand mask for multi-head attention
             expanded_mask = mask.unsqueeze(1).unsqueeze(1)  # [batch_size, 1, 1, seq_len]
             attention_scores = attention_scores.masked_fill(expanded_mask == 0, -1e9)
+            
+            # Handle edge case where entire sequence is padded
+            # In this case, all scores will be -inf, leading to NaN after softmax
+            for batch_idx in range(batch_size):
+                if mask_sum[batch_idx] == 0:
+                    # Entire sequence is padded - set uniform attention
+                    # This prevents NaN by giving equal weight to all positions
+                    attention_scores[batch_idx, :, :, :] = 0.0
         
         # Apply softmax to get attention weights
         attention_weights = F.softmax(attention_scores, dim=-1)  # [batch_size, num_heads, 1, seq_len]
+        
+        # Final safety check for NaN in attention weights
+        if torch.isnan(attention_weights).any():
+            # This should not happen with the fix above, but just in case
+            # Replace NaN with uniform distribution
+            nan_mask = torch.isnan(attention_weights)
+            uniform_attn = torch.ones_like(attention_weights) / seq_len
+            attention_weights = torch.where(nan_mask, uniform_attn, attention_weights)
         
         # Save attention weights if requested
         if self.save_attention:
@@ -506,7 +584,9 @@ class PackageLevelAttention(nn.Module):
             
         output = self.layer_norm(output)
         
-        return output.squeeze(1)
+        # Return without squeezing to maintain shape consistency
+        # output shape: [batch_size, 1, hidden_dim]
+        return output
 
 
 class UserEncoder(nn.Module):
@@ -515,6 +595,20 @@ class UserEncoder(nn.Module):
         super().__init__()
         
         self.user_embedding = nn.Embedding(config.num_users, config.user_embedding_dim, padding_idx=0)
+        # Initialize user embeddings with Xavier/Glorot initialization for better differentiation
+        with torch.no_grad():
+            # Use Xavier uniform initialization for better initial differentiation between users
+            nn.init.xavier_uniform_(self.user_embedding.weight)
+            # Ensure padding embedding stays at zero
+            self.user_embedding.weight[0] = 0
+            
+            # Double-check no NaN values after initialization
+            if torch.isnan(self.user_embedding.weight).any():
+                print(f"WARNING: NaN found in user embedding after initialization!")
+                nan_indices = torch.where(torch.isnan(self.user_embedding.weight).any(dim=1))[0]
+                print(f"NaN at indices: {nan_indices.tolist()[:10]}...")  # Show first 10
+                # Replace NaN with small random values
+                self.user_embedding.weight[nan_indices] = torch.randn(len(nan_indices), config.user_embedding_dim) * 0.01
         
         # Increased to multi-layer Bi-LSTM with layer normalization
         self.short_term_lstm = nn.LSTM(
@@ -570,6 +664,22 @@ class UserEncoder(nn.Module):
         # Get user embeddings
         user_emb = self.user_embedding(user_ids)
         
+        # Check if embeddings are NaN right after lookup
+        if torch.isnan(user_emb).any():
+            print(f"ERROR: User embeddings are NaN right after lookup!")
+            nan_mask = torch.isnan(user_emb).any(dim=1)
+            nan_user_ids = user_ids[nan_mask]
+            print(f"User IDs that produce NaN: {nan_user_ids}")
+            print(f"Embedding table size: {self.user_embedding.num_embeddings}")
+            print(f"Max ID with NaN: {nan_user_ids.max().item() if len(nan_user_ids) > 0 else 'N/A'}")
+            
+            # Check if these IDs are within bounds
+            if len(nan_user_ids) > 0 and nan_user_ids.max() >= self.user_embedding.num_embeddings:
+                print(f"ERROR: User ID {nan_user_ids.max().item()} >= num_embeddings {self.user_embedding.num_embeddings}")
+            
+            # Replace with small random values
+            user_emb = torch.where(nan_mask.unsqueeze(1), torch.randn_like(user_emb) * 0.01, user_emb)
+        
         # Process sequences with multi-layer LSTM
         short_term_output, _ = self.short_term_lstm(short_term_repr)
         short_term_output = self.short_term_norm(short_term_output)  # Apply layer normalization
@@ -579,22 +689,46 @@ class UserEncoder(nn.Module):
         
         # Apply cross-attention between sequences to capture interactions
         # Short-term as query, long-term as key/value
-        cross_st_mask = None
-        if short_term_mask is not None and long_term_mask is not None:
-            cross_st_mask = torch.bmm(
-                short_term_mask.unsqueeze(-1).float(), 
-                long_term_mask.unsqueeze(1).float()
-            ).bool()
-        
-        cross_attended_short, _ = self.cross_attention(
-            short_term_output, 
-            long_term_output, 
-            long_term_output,
-            key_padding_mask=None if long_term_mask is None else ~long_term_mask.bool()
-        )
-        
-        # Enhance short-term representation with cross-attention
-        enhanced_short_term = short_term_output + cross_attended_short
+        # Handle case where long-term is entirely masked to prevent NaN
+        if long_term_mask is not None:
+            long_term_valid_count = long_term_mask.sum(dim=1)
+            has_valid_long_term = long_term_valid_count > 0
+            
+            # Only apply cross-attention if there are valid long-term items
+            if has_valid_long_term.all():
+                # All batches have valid long-term, proceed normally
+                cross_attended_short, _ = self.cross_attention(
+                    short_term_output, 
+                    long_term_output, 
+                    long_term_output,
+                    key_padding_mask=~long_term_mask.bool()
+                )
+                enhanced_short_term = short_term_output + cross_attended_short
+            else:
+                # Some batches have no valid long-term items
+                # Process only batches with valid long-term separately
+                enhanced_short_term = short_term_output.clone()
+                
+                if has_valid_long_term.any():
+                    # Process batches with valid long-term
+                    valid_indices = torch.where(has_valid_long_term)[0]
+                    cross_attended_valid, _ = self.cross_attention(
+                        short_term_output[valid_indices], 
+                        long_term_output[valid_indices], 
+                        long_term_output[valid_indices],
+                        key_padding_mask=~long_term_mask[valid_indices].bool()
+                    )
+                    enhanced_short_term[valid_indices] = short_term_output[valid_indices] + cross_attended_valid
+                
+                # Batches with no valid long-term use original short-term (no enhancement)
+        else:
+            # No mask provided, apply cross-attention normally
+            cross_attended_short, _ = self.cross_attention(
+                short_term_output, 
+                long_term_output, 
+                long_term_output
+            )
+            enhanced_short_term = short_term_output + cross_attended_short
         
         # Apply package-level attention as before, but with enhanced representations
         short_term_pref = self.package_attention(
@@ -666,8 +800,9 @@ class GatedFusion(nn.Module):
         # Apply gated fusion with the adjusted gate
         fused = adjusted_gate * long_term_proj + (1 - adjusted_gate) * short_term_proj
         
-        # Add residual connection with the user embedding
-        fused = fused + 0.1 * user_proj
+        # Add moderate residual connection with the user embedding
+        # Balanced at 0.3 to allow personalization without overwhelming item preferences
+        fused = fused + 0.3 * user_proj
         
         # Final projection and normalization
         fused = self.output_projection(fused)
@@ -700,9 +835,65 @@ class NATR(nn.Module):
             nn.Linear(config.hidden_dim * 2, config.num_packages)
         )
         
+        # Add user-specific transformation to ensure personalization
+        self.user_transform = nn.Linear(config.user_embedding_dim, config.num_packages)
+        # Initialize with larger scale to ensure user signals aren't overwhelmed
+        with torch.no_grad():
+            nn.init.xavier_uniform_(self.user_transform.weight, gain=0.5)  # Increased from 0.1 to 0.5
+            nn.init.zeros_(self.user_transform.bias)
+            
+        # Flag to track user learning
+        self.monitor_user_learning = True
+        
+        # Popularity modeling
+        # Learnable popularity bias for each package
+        self.popularity_bias = nn.Parameter(torch.zeros(config.num_packages))
+        
+        # Optional: Learnable popularity embeddings for richer representation
+        # Disable by default to avoid popularity dominating personalization
+        self.use_popularity_embedding = getattr(config, 'use_popularity_embedding', False)
+        if self.use_popularity_embedding:
+            self.popularity_embedding = nn.Embedding(config.num_packages, 32)
+            # Project popularity embedding to combine with predictions
+            self.popularity_projection = nn.Linear(32, 1)
+            # Learnable weight for popularity contribution - start very small
+            self.popularity_weight = nn.Parameter(torch.tensor(0.01))
+        
         # Debug mode for capturing attention weights
         self.debug_mode = False
         self.attention_weights = {}
+    
+    def initialize_popularity(self, item_frequencies):
+        """Initialize popularity bias and embeddings based on item frequencies
+        
+        Args:
+            item_frequencies: Tensor of shape [num_packages] with frequency counts
+        """
+        with torch.no_grad():
+            # Normalize frequencies and apply log transform with smoothing
+            # Add smoothing to avoid extreme negative values for unpurchased items
+            smoothed_freq = item_frequencies + 0.1  # Add small count to all items
+            normalized_freq = smoothed_freq / smoothed_freq.sum()
+            log_popularity = torch.log(normalized_freq)
+            
+            # Center and scale to reasonable range
+            log_popularity = log_popularity - log_popularity.mean()
+            log_popularity = log_popularity / (log_popularity.std() + 1e-8)
+            
+            # Initialize bias with scaled log-popularity
+            # Scale down significantly to avoid overwhelming the learned representations
+            self.popularity_bias.data = log_popularity * 0.001  # Very small scaling to not dominate
+            
+            # Initialize popularity embeddings if used
+            if self.use_popularity_embedding:
+                # Use frequency rank as additional signal
+                _, sorted_indices = torch.sort(item_frequencies, descending=True)
+                rank = torch.zeros(len(sorted_indices), dtype=torch.float32, device=sorted_indices.device)
+                rank[sorted_indices] = torch.arange(len(sorted_indices), dtype=torch.float32, device=sorted_indices.device)
+                
+                # Initialize first dimension with log frequency, second with rank
+                self.popularity_embedding.weight.data[:, 0] = log_popularity
+                self.popularity_embedding.weight.data[:, 1] = -rank / len(rank)  # Negative so higher rank = higher value
     
     def enable_debug(self, enable=True):
         """Enable debug mode to capture attention weights"""
@@ -718,9 +909,34 @@ class NATR(nn.Module):
         # Extract user IDs
         user_ids = batch['user_id']
         
-        # Encode packages with event information
-        short_term_repr = self.package_encoder(batch['short_term'])
-        long_term_repr = self.package_encoder(batch['long_term'])
+        # Debug: Check user ID range
+        max_user_id = user_ids.max().item()
+        if max_user_id >= self.user_encoder.user_embedding.num_embeddings:
+            print(f"ERROR: User ID {max_user_id} >= num_embeddings {self.user_encoder.user_embedding.num_embeddings}")
+            print(f"User IDs sample: {user_ids[:10].tolist()}")
+            # Clamp to valid range
+            user_ids = torch.clamp(user_ids, 0, self.user_encoder.user_embedding.num_embeddings - 1)
+        
+        # Validate user IDs are within bounds
+        if user_ids.max() >= self.user_encoder.user_embedding.num_embeddings:
+            print(f"ERROR: User ID out of bounds! Max ID: {user_ids.max().item()}, num_embeddings: {self.user_encoder.user_embedding.num_embeddings}")
+            # Clamp to valid range
+            user_ids = torch.clamp(user_ids, 0, self.user_encoder.user_embedding.num_embeddings - 1)
+        
+        # Get user embeddings for personalized attention
+        user_emb = self.user_encoder.user_embedding(user_ids)
+        
+        # Check for NaN values
+        if torch.isnan(user_emb).any():
+            print(f"WARNING: NaN detected in user embeddings! User IDs: {user_ids[:5]}")
+            print(f"  Embedding shape: {user_emb.shape}, num_embeddings: {self.user_encoder.user_embedding.num_embeddings}")
+            print(f"  Max user ID in batch: {user_ids.max().item()}, Min: {user_ids.min().item()}")
+            # Initialize with small random values instead of zeros
+            user_emb = torch.randn_like(user_emb) * 0.01
+        
+        # Encode packages with event information and personalized attention
+        short_term_repr = self.package_encoder(batch['short_term'], user_emb)
+        long_term_repr = self.package_encoder(batch['long_term'], user_emb)
         
         # Create masks
         short_term_mask = (batch['short_term']['package_ids'] > 0).float()
@@ -742,13 +958,79 @@ class NATR(nn.Module):
         )
         
         # Fuse preferences
-        user_final_repr = self.gated_fusion(short_term_pref, long_term_pref, user_emb)
+        # Squeeze out the sequence dimension (which should be 1) from attention outputs
+        short_term_pref_2d = short_term_pref.squeeze(1)
+        long_term_pref_2d = long_term_pref.squeeze(1)
+        user_final_repr = self.gated_fusion(short_term_pref_2d, long_term_pref_2d, user_emb)
         
-        # Make predictions
+        # Make predictions with user-specific component
         predictions = self.prediction_head(user_final_repr)
         
-        # Encode purchased package
-        purchased_repr = self.package_encoder(batch['purchased'])
+        # Add user-specific bias with adaptive weighting
+        user_bias = self.user_transform(user_emb)
+        # Use tanh to bound the user bias and prevent extreme personalization
+        user_bias = torch.tanh(user_bias / 5.0) * 5.0  # Bound between -5 and 5
+        
+        # Adaptive weighting: stronger personalization for users with more history
+        # This helps maintain accuracy for users with clear preferences
+        has_history = batch.get('has_short_term', torch.ones(user_emb.size(0), dtype=torch.bool, device=user_emb.device))
+        personalization_weight = torch.where(has_history.unsqueeze(1), 0.3, 0.1)  # 0.3 for users with history, 0.1 for cold start
+        predictions = predictions + personalization_weight * user_bias
+        
+        # Re-enable popularity bias with adaptive scale
+        # Stronger for cold start users, weaker for users with history
+        # COMMENTED OUT: Testing without popularity features
+        # popularity_scale = torch.where(has_history.unsqueeze(1), 0.005, 0.01)  # Smaller scale for users with history
+        # predictions = predictions + (self.popularity_bias.unsqueeze(0) * popularity_scale)
+        
+        # Enhanced debug: Monitor user learning more frequently and thoroughly
+        if self.training and self.monitor_user_learning and torch.rand(1).item() < 0.001:  # Back to less frequent monitoring
+            pred_std = predictions.std(dim=0).mean().item()
+            user_repr_std = user_final_repr.std(dim=0).mean().item()
+            
+            # Check user bias before tanh transformation
+            raw_user_bias = self.user_transform(user_emb)
+            raw_bias_std = raw_user_bias.std(dim=0).mean().item()
+            raw_bias_range = raw_user_bias.max().item() - raw_user_bias.min().item()
+            tanh_bias_std = user_bias.std(dim=0).mean().item()
+            
+            # Check user embedding variance
+            user_emb_std = user_emb.std(dim=0).mean().item()
+            user_emb_range = user_emb.max().item() - user_emb.min().item()
+            
+            print(f"🔍 User Learning Monitor:")
+            print(f"  Prediction std: {pred_std:.4f}")
+            print(f"  User embedding std: {user_emb_std:.4f}, range: {user_emb_range:.4f}")
+            print(f"  Raw user bias std: {raw_bias_std:.4f}, range: {raw_bias_range:.4f}")
+            print(f"  Tanh user bias std: {tanh_bias_std:.4f}")
+            
+            # Simple diversity check (much faster)
+            if len(user_emb) > 1:
+                # Quick check: just compare first two users if they exist
+                if len(predictions) >= 2:
+                    pred_diff = torch.abs(predictions[0] - predictions[1]).mean().item()
+                    print(f"  Quick diversity check - pred diff: {pred_diff:.4f}")
+                    if pred_diff < 0.01:
+                        print("  ⚠️  Users have very similar predictions!")
+                    elif pred_diff > 0.1:
+                        print("  ✅ Users have diverse predictions!")
+        
+        # Add popularity embedding contribution if enabled
+        if self.use_popularity_embedding:
+            # Get all package indices (0 to num_packages-1)
+            package_indices = torch.arange(self.config.num_packages, device=predictions.device)
+            
+            # Get popularity embeddings for all packages
+            pop_embeddings = self.popularity_embedding(package_indices)  # [num_packages, 32]
+            
+            # Project to scalar values
+            pop_scores = self.popularity_projection(pop_embeddings).squeeze(-1)  # [num_packages]
+            
+            # Add weighted popularity scores to predictions
+            predictions = predictions + self.popularity_weight * pop_scores.unsqueeze(0)
+        
+        # Encode purchased package with personalized attention
+        purchased_repr = self.package_encoder(batch['purchased'], user_emb)
         
         # Collect attention weights in debug mode
         if self.debug_mode:
@@ -761,8 +1043,9 @@ class NATR(nn.Module):
             'predictions': predictions,
             'user_representation': user_final_repr,
             'purchased_representation': purchased_repr,
-            'short_term_preference': short_term_pref,
-            'long_term_preference': long_term_pref
+            'short_term_preference': short_term_pref_2d,
+            'long_term_preference': long_term_pref_2d,
+            'user_embedding': user_emb  # Include for potential regularization
         }
         
         # Add attention weights in debug mode

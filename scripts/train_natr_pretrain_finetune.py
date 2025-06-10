@@ -31,7 +31,13 @@ if hasattr(torch, 'set_float32_matmul_precision'):
 from models.natr import NATR, NATRConfig
 from utils.session_processor import SessionProcessor
 from utils.package_processor import PackageProcessor, TravelPackageDataset
+from utils.unified_metrics import UnifiedMetricsTracker, MetricsTracker, EnhancedEventMetrics
 from utils.loss_functions import NaturalPurchaseLoss, FocalLoss
+from utils.memory_utils import (
+    detect_device, create_memory_config, MemoryOptimizer, AMPManager, 
+    GradientAccumulator, get_optimal_batch_size, print_memory_stats,
+    create_optimizer_with_memory_optimizations, get_model_size
+)
 
 # Import consolidated utilities
 from utils.training_utils import (
@@ -46,8 +52,13 @@ from utils.training_utils import (
     create_dataloaders,
     set_performance_mode,
     clear_memory,
-    limit_samples_for_testing
+    limit_samples_for_testing,
+    identify_event_types
 )
+
+# Import the enhanced evaluation function from train_natr.py
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from train_natr import evaluate_with_unified_metrics
 
 
 def create_next_item_prediction_targets(samples):
@@ -195,6 +206,10 @@ def train_epoch_with_soft_labels(model, train_loader, optimizer, loss_fn, device
         loss = loss_fn(predictions, targets, soft_labels)
         
         loss.backward()
+        
+        # Apply gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
         
         total_loss += loss.item()
@@ -257,7 +272,7 @@ def pretrain_phase(model, train_loader, test_loader, device, performance_config)
     )
     
     # Training loop for pre-training
-    best_overall_recall = 0
+    best_purchase_recall = 0
     history = {'train_loss': [], 'test_metrics': []}
     
     for epoch in range(num_epochs):
@@ -270,14 +285,18 @@ def pretrain_phase(model, train_loader, test_loader, device, performance_config)
         )
         train_time = time.time() - start_time
         
-        # Evaluate
+        # Evaluate with unified metrics (includes item coverage)
         start_time = time.time()
-        test_metrics = evaluate(model, test_loader, device, k_values=[5, 10, 20])
+        # Create simple memory optimizer for evaluation
+        memory_config = create_memory_config(device.type, "balanced")
+        memory_optimizer = MemoryOptimizer(device, memory_config)
+        test_metrics = evaluate_with_unified_metrics(model, test_loader, device, memory_optimizer, k_values=[10, 20, 50])
         eval_time = time.time() - start_time
         
-        # Update scheduler based on overall recall metric (not purchase specific)
-        current_overall_recall = test_metrics['recall@k'][10]
-        scheduler.step(current_overall_recall)
+        # Update scheduler based on purchase recall@20 metric
+        # Purchase recall@20 aligns directly with the final fine-tuning objective
+        current_purchase_recall = test_metrics.get('purchase_recall@20', 0.0)
+        scheduler.step(current_purchase_recall)
         
         # Store history
         history['train_loss'].append(train_loss)
@@ -288,12 +307,16 @@ def pretrain_phase(model, train_loader, test_loader, device, performance_config)
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
         print(f"\nTest Metrics (Next Item Prediction):")
-        print(f"  Overall Recall@10: {test_metrics['recall@k'][10]*100:.2f}%")
-        print(f"  Overall MRR: {test_metrics['overall_mrr']:.4f}")
+        print(f"  Overall MRR: {test_metrics.get('overall_mrr', 0.0):.4f}")
+        print(f"  Purchase Recall@20: {test_metrics.get('purchase_recall@20', 0.0)*100:.2f}%")
+        if 'checkout_recall@20' in test_metrics:
+            print(f"  Checkout Recall@20: {test_metrics['checkout_recall@20']*100:.2f}%")
+        if 'item_coverage@20' in test_metrics:
+            print(f"  Item Coverage@20: {test_metrics['item_coverage@20']*100:.2f}%")
         
-        # Save best model
-        if current_overall_recall > best_overall_recall:
-            best_overall_recall = current_overall_recall
+        # Save best model based on purchase recall@20
+        if current_purchase_recall > best_purchase_recall:
+            best_purchase_recall = current_purchase_recall
             
             # Save pre-trained checkpoint
             os.makedirs('checkpoints/natr', exist_ok=True)
@@ -301,17 +324,17 @@ def pretrain_phase(model, train_loader, test_loader, device, performance_config)
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_overall_recall': best_overall_recall,
+                'best_purchase_recall': best_purchase_recall,
                 'history': history,
                 'timestamp': datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             }
             torch.save(checkpoint, 'checkpoints/natr/pretrained_model.pth')
-            print(f"  ✓ New best pre-trained model saved! Overall Recall@10: {best_overall_recall*100:.2f}%")
+            print(f"  ✓ New best pre-trained model saved! Purchase Recall@20: {best_purchase_recall*100:.2f}%")
     
     print("\nPre-training complete!")
-    print(f"Best Overall Recall@10: {best_overall_recall*100:.2f}%")
+    print(f"Best Purchase Recall@20: {best_purchase_recall*100:.2f}%")
     
-    return model, best_overall_recall, history
+    return model, best_purchase_recall, history
 
 
 def finetune_phase(model, train_loader, test_loader, device, performance_config):
@@ -326,14 +349,38 @@ def finetune_phase(model, train_loader, test_loader, device, performance_config)
     use_amp = performance_config.get("use_amp", False) and device.type == 'cuda'
     early_stopping_patience = performance_config.get("patience", 8)
     
-    # Configure optimizer - only train certain layers or all with different learning rates
-    # Option 1: Fine-tune the entire model with a lower learning rate
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=0.05,  # Higher weight decay for fine-tuning (increased from 0.03)
-        eps=1e-8
-    )
+    # Configure optimizer with enhanced user learning (multi-rate optimization)
+    print("Creating custom optimizer with enhanced user learning for fine-tuning...")
+    
+    # Separate parameters for different learning rates
+    user_params = []
+    user_transform_params = []
+    other_params = []
+    
+    for name, param in model.named_parameters():
+        if 'user_encoder.user_embedding' in name:
+            user_params.append(param)
+        elif 'user_transform' in name:
+            user_transform_params.append(param)
+        else:
+            other_params.append(param)
+    
+    # Create optimizer with different learning rates for enhanced user learning
+    user_lr = learning_rate * 2.0  # 2x learning rate for user embeddings
+    user_transform_lr = learning_rate * 10.0  # 10x learning rate for user transform
+    
+    optimizer = optim.AdamW([
+        {'params': other_params, 'lr': learning_rate, 'weight_decay': 0.05},
+        {'params': user_params, 'lr': user_lr, 'weight_decay': 1e-6},  # Less regularization for users
+        {'params': user_transform_params, 'lr': user_transform_lr, 'weight_decay': 1e-6}
+    ], eps=1e-8)
+    
+    print(f"  Base learning rate: {learning_rate}")
+    print(f"  User embedding learning rate: {user_lr}")
+    print(f"  User transform learning rate: {user_transform_lr}")
+    print(f"  User embedding params: {sum(p.numel() for p in user_params)}")
+    print(f"  User transform params: {sum(p.numel() for p in user_transform_params)}")
+    print(f"  Other params: {sum(p.numel() for p in other_params)}")
     
     # Option 2 (Alternative): Fine-tune specific layers with different learning rates
     # This creates layer-specific learning rates, higher for layers that need more adaptation
@@ -354,9 +401,9 @@ def finetune_phase(model, train_loader, test_loader, device, performance_config)
     ], weight_decay=0.05, eps=1e-8)
     """
     
-    # Use NaturalPurchaseLoss with moderate boost for fine-tuning
+    # Use NaturalPurchaseLoss with strong boost for fine-tuning
     loss_fn = NaturalPurchaseLoss(
-        purchase_boost=4.0  # Moderate boost for purchase emphasis during fine-tuning
+        purchase_boost=20.0  # Increased from 4.0 for much stronger purchase signal
     )
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -370,6 +417,7 @@ def finetune_phase(model, train_loader, test_loader, device, performance_config)
     
     # Training loop for fine-tuning
     best_purchase_recall = 0
+    best_purchase_mrr = 0
     epochs_without_improvement = 0
     history = {'train_loss': [], 'test_metrics': []}
     
@@ -385,13 +433,16 @@ def finetune_phase(model, train_loader, test_loader, device, performance_config)
         )
         train_time = time.time() - start_time
         
-        # Evaluate
+        # Evaluate with unified metrics (includes item coverage)
         start_time = time.time()
-        test_metrics = evaluate(model, test_loader, device, k_values=[5, 10, 20])
+        # Create simple memory optimizer for evaluation
+        memory_config = create_memory_config(device.type, "balanced")
+        memory_optimizer = MemoryOptimizer(device, memory_config)
+        test_metrics = evaluate_with_unified_metrics(model, test_loader, device, memory_optimizer, k_values=[10, 20, 50])
         eval_time = time.time() - start_time
         
-        # Update scheduler based on purchase recall metric
-        current_purchase_recall = test_metrics['purchase_recall@k'][10]
+        # Update scheduler based on purchase recall metric (using @20 as primary)
+        current_purchase_recall = test_metrics.get('purchase_recall@20', 0.0)
         scheduler.step(current_purchase_recall)
         
         # Store history
@@ -403,13 +454,28 @@ def finetune_phase(model, train_loader, test_loader, device, performance_config)
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
         print(f"\nTest Metrics:")
-        print(f"  Overall Recall@10: {test_metrics['recall@k'][10]*100:.2f}%")
-        print(f"  Purchase Recall@10: {test_metrics['purchase_recall@k'][10]*100:.2f}%")
-        print(f"  Purchase MRR: {test_metrics['purchase_mrr']:.4f}")
+        print(f"  Purchase Recall@10: {test_metrics.get('purchase_recall@10', 0.0)*100:.2f}%")
+        print(f"  Purchase Recall@20: {test_metrics.get('purchase_recall@20', 0.0)*100:.2f}%")
+        print(f"  Purchase MRR: {test_metrics.get('purchase_mrr', 0.0):.4f}")
+        if 'item_coverage@20' in test_metrics:
+            print(f"  Item Coverage@20: {test_metrics['item_coverage@20']*100:.2f}%")
         
-        # Save best model
-        if current_purchase_recall > best_purchase_recall:
+        # Save best model based on Purchase Recall@20 with MRR as tiebreaker
+        epsilon = 1e-6  # tolerance for considering recalls as similar
+        current_purchase_mrr = test_metrics.get('purchase_mrr', 0.0)
+        
+        is_better = False
+        if current_purchase_recall > best_purchase_recall + epsilon:
+            # Clear improvement in recall@20
+            is_better = True
+        elif abs(current_purchase_recall - best_purchase_recall) <= epsilon:
+            # Recall@20 is effectively the same, use MRR as tiebreaker
+            if current_purchase_mrr > best_purchase_mrr:
+                is_better = True
+        
+        if is_better:
             best_purchase_recall = current_purchase_recall
+            best_purchase_mrr = current_purchase_mrr
             epochs_without_improvement = 0
             
             # Save fine-tuned checkpoint
@@ -423,7 +489,7 @@ def finetune_phase(model, train_loader, test_loader, device, performance_config)
                 'timestamp': datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             }
             torch.save(checkpoint, 'checkpoints/natr/finetuned_model.pth')
-            print(f"  ✓ New best fine-tuned model saved! Purchase Recall@10: {best_purchase_recall*100:.2f}%")
+            print(f"  ✓ New best fine-tuned model saved! Purchase Recall@20: {best_purchase_recall*100:.2f}%, MRR: {current_purchase_mrr:.4f}")
         else:
             epochs_without_improvement += 1
             print(f"  No improvement for {epochs_without_improvement} epochs")
@@ -447,9 +513,10 @@ def finetune_phase(model, train_loader, test_loader, device, performance_config)
                 break
     
     print("\nFine-tuning complete!")
-    print(f"Best Purchase Recall@10: {best_purchase_recall*100:.2f}%")
+    print(f"Best Purchase Recall@20: {best_purchase_recall*100:.2f}%")
+    print(f"Best Purchase MRR: {best_purchase_mrr:.4f}")
     
-    return model, best_purchase_recall, history
+    return model, best_purchase_recall, best_purchase_mrr
 
 
 def get_pretrain_finetune_config(mode="balanced"):
@@ -461,30 +528,36 @@ def get_pretrain_finetune_config(mode="balanced"):
     
     if mode == "apple_silicon" or (mode == "balanced" and is_mps):
         config.update({
-            "pretrain_epochs": 1,                # Number of epochs for pretraining phase
-            "finetune_epochs": 10                # Number of epochs for fine-tuning phase
+            "pretrain_epochs": 3,                # Changed from 7 to 3 - testing with fewer pretrain epochs
+            "finetune_epochs": 20                # Number of epochs for fine-tuning phase
         })
     elif mode == "fastest":
         config.update({
-            "pretrain_epochs": 3,                # Fewer epochs for pretraining phase
-            "finetune_epochs": 10                # Fewer epochs for fine-tuning phase
+            "pretrain_epochs": 3,                # Changed from 5 to 3 - testing with fewer pretrain epochs
+            "finetune_epochs": 20                # Finetune epochs for fastest mode
         })
     elif mode == "accurate":
         config.update({
-            "pretrain_epochs": 10,               # More epochs for pretraining phase
-            "finetune_epochs": 30                # More epochs for fine-tuning phase
+            "pretrain_epochs": 3,                # Changed from 5 to 3 - testing with fewer pretrain epochs
+            "finetune_epochs": 20                # Finetune epochs for accurate mode
         })
     else:  # "balanced" mode (non-MPS)
         config.update({
-            "pretrain_epochs": 1,                # Medium number of epochs for pretraining phase
-            "finetune_epochs": 10                # Medium number of epochs for fine-tuning phase
+            "pretrain_epochs": 3,                # Changed from 7 to 3 - testing with fewer pretrain epochs
+            "finetune_epochs": 20                # Finetune epochs for balanced mode
         })
     
     return config
 
 
-def main(performance_config=None):
-    """Main function implementing pre-training + fine-tuning strategy"""
+def main(performance_config=None, dataset="13months", event_data_path=None):
+    """Main function implementing pre-training + fine-tuning strategy
+    
+    Args:
+        performance_config: Performance configuration dict
+        dataset (str): Dataset to use - '13months' or '2months'
+        event_data_path (str): Optional explicit path to event data file
+    """
     # Set device - for Apple Silicon (M1/M2/M3), we can use MPS
     if torch.cuda.is_available():
         device = torch.device('cuda')
@@ -520,12 +593,29 @@ def main(performance_config=None):
     
     # Data paths
     package_data_path = "data/feed.parquet"
-    event_data_path = "data/bookit_events_data_13_months.parquet"
+    
+    # Determine event data path
+    if event_data_path is None:
+        # Map dataset selection to file path
+        dataset_map = {
+            '13months': 'data/bookit_events_data_13_months.parquet',
+            '2months': 'data/bookit_events_2_months.parquet'
+        }
+        
+        event_data_path = dataset_map.get(dataset)
+        if not event_data_path:
+            raise ValueError(f"Unknown dataset: {dataset}. Use '13months' or '2months'")
+        
+        # Check if file exists
+        if not os.path.exists(event_data_path):
+            raise FileNotFoundError(f"Event data file not found: {event_data_path}")
+    
+    print(f"Using event data: {event_data_path}")
     
     # Initialize processors
     print("\nInitializing data processors...")
     package_processor = PackageProcessor(
-        data_path=package_data_path,
+        feed_data_path=package_data_path,  # Updated parameter name
         cache_dir='data/cache',
         load_coordinates=True,
         load_embeddings=True,
@@ -535,9 +625,9 @@ def main(performance_config=None):
     )
     
     session_processor = SessionProcessor(
-        data_path=event_data_path,
+        event_data_path=event_data_path,  # Updated parameter name
         cache_dir='data/cache',
-        min_interactions=10,  # Users must have at least 10 interactions
+        min_interactions=5,
         max_sessions_per_user=20,
         max_samples_per_user=10
     )
@@ -586,16 +676,19 @@ def main(performance_config=None):
     print("\n5. Preparing training samples...")
     samples = session_processor.prepare_enhanced_training_data()
     
+    # Identify event types in samples (checkout, add-to-cart)
+    samples = identify_event_types(samples, session_processor.event_to_idx)
+    
     # Limit samples for testing if needed
     samples = limit_samples_for_testing(samples)
     
     print("\n6. Applying data filters...")
     
     # Apply session length filtering - quality improves with longer sessions
-    quality_samples = filter_by_min_session_length(samples, min_session_length=3)
+    quality_samples = filter_by_min_session_length(samples, min_session_length=2)
     
     # Filter items by frequency - focus on packages with sufficient data
-    filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=50)
+    filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=5)  # Reduced from 10
     
     # Validate that we have purchase events
     purchase_count = sum(1 for s in filtered_samples if s.get('is_purchase', False))
@@ -605,7 +698,7 @@ def main(performance_config=None):
     print(f"Purchase events: {purchase_count} ({purchase_count / len(filtered_samples) * 100:.2f}% of all events)")
     
     # Time-based split for main dataset
-    all_train_samples, test_samples = time_based_split_year(filtered_samples, train_ratio=0.93)
+    all_train_samples, test_samples, split_date = time_based_split_year(filtered_samples, train_ratio=0.91)
     
     # Ensure evaluation set has enough purchases for meaningful metrics
     purchase_samples = [s for s in test_samples if s.get('is_purchase', False)]
@@ -617,6 +710,23 @@ def main(performance_config=None):
         # Remove these from train samples
         all_train_samples = [s for s in all_train_samples if s not in extra_purchases]
         print(f"Added {len(extra_purchases)} more purchase samples to test set")
+    
+    # IMPORTANT: Update user mappings to include ALL users from both train and test sets
+    print("\n6b. Updating user mappings to include test users...")
+    all_users = set()
+    for sample in all_train_samples + test_samples:
+        all_users.add(sample['user_id'])
+    
+    # Check if we have unmapped users
+    unmapped_users = all_users - set(session_processor.user_to_idx.keys())
+    if unmapped_users:
+        print(f"Found {len(unmapped_users)} unmapped users (likely from test set)")
+        # Add them to the mapping
+        max_idx = max(session_processor.user_to_idx.values()) if session_processor.user_to_idx else 0
+        for user_id in unmapped_users:
+            max_idx += 1
+            session_processor.user_to_idx[user_id] = max_idx
+        print(f"Updated user mappings. Total users: {len(session_processor.user_to_idx)}")
     
     # Analyze distributions
     analyze_data_distribution(all_train_samples, "Train (Original)")
@@ -638,7 +748,8 @@ def main(performance_config=None):
     embedding_dim = performance_config.get("embedding_dim", 256)
     dropout = performance_config.get("dropout", 0.2)
     
-    # Get actual dimensions from mappings
+    # Get actual dimensions from mappings (add 1 because indices start at 1, not 0)
+    # IMPORTANT: These dimensions must include ALL users/packages from both train and test sets
     num_users = max(session_processor.user_to_idx.values()) + 1
     num_packages = max(session_processor.package_to_idx.values()) + 1
     
@@ -685,6 +796,32 @@ def main(performance_config=None):
     print(f"  Embedding dimension: {config.embedding_dim}")
     print(f"  User embedding dimension: {config.user_embedding_dim}")
     
+    # Initialize popularity bias based on item frequencies in training data
+    print("Calculating item frequencies for popularity initialization...")
+    item_frequencies = torch.zeros(num_packages)
+    
+    # Use balanced_samples for popularity calculation as it includes purchase events
+    for sample in balanced_samples:
+        # Give higher weight to purchased items
+        if sample.get('is_purchase', False) and 'purchased_package' in sample:
+            pkg_id = sample['purchased_package']
+            if str(pkg_id) in session_processor.package_to_idx:
+                idx = session_processor.package_to_idx[str(pkg_id)]
+                if idx < num_packages:  # Ensure index is within bounds
+                    item_frequencies[idx] += 1.0  # Full weight for purchases
+        
+        # Give lower weight to other interactions
+        for pkg_id in sample.get('short_term_packages', []) + sample.get('long_term_packages', []):
+            if str(pkg_id) in session_processor.package_to_idx:
+                idx = session_processor.package_to_idx[str(pkg_id)]
+                if idx < num_packages:  # Ensure index is within bounds
+                    item_frequencies[idx] += 0.1  # Lower weight for non-purchased interactions
+    
+    # Initialize popularity in the model
+    # COMMENTED OUT: Testing without popularity features
+    # print(f"Initializing popularity bias with item frequencies (max freq: {item_frequencies.max().item():.0f})")
+    # model.initialize_popularity(item_frequencies.to(device))
+    
     # Compile model if enabled and available
     if performance_config.get("compile_model", False) and hasattr(torch, 'compile'):
         if device.type == 'cuda':
@@ -710,7 +847,7 @@ def main(performance_config=None):
     
     # Pre-train model
     print("\n9. Starting pre-training phase...")
-    model, best_pretrain_recall, pretrain_history = pretrain_phase(
+    model, best_pretrain_recall, _ = pretrain_phase(
         model, pretrain_train_loader, pretrain_test_loader, device, performance_config
     )
     
@@ -727,21 +864,22 @@ def main(performance_config=None):
     
     # Fine-tune model
     print("\n11. Starting fine-tuning phase...")
-    model, best_finetune_recall, finetune_history = finetune_phase(
+    model, best_finetune_recall, best_finetune_mrr = finetune_phase(
         model, finetune_train_loader, finetune_test_loader, device, performance_config
     )
     
     # Final summary
     print("\n12. Training complete!")
-    print(f"Pre-training best Overall Recall@10: {best_pretrain_recall*100:.2f}%")
-    print(f"Fine-tuning best Purchase Recall@10: {best_finetune_recall*100:.2f}%")
+    print(f"Pre-training best Purchase Recall@20: {best_pretrain_recall*100:.2f}%")
+    print(f"Fine-tuning best Purchase Recall@20: {best_finetune_recall*100:.2f}%")
     
-    # Save model info
+    # Save model info with @20 metrics
     model_info = {
         'config': config.__dict__,
         'valid_packages': list(valid_packages),
-        'best_pretrain_recall': best_pretrain_recall,
-        'best_finetune_recall': best_finetune_recall,
+        'best_pretrain_purchase_recall@20': best_pretrain_recall,
+        'best_finetune_recall@20': best_finetune_recall,
+        'best_finetune_mrr': best_finetune_mrr,
         'checkpoint_path': 'checkpoints/natr/finetuned_model.pth',
         'package_data_path': package_data_path,
         'event_data_path': event_data_path,
@@ -751,10 +889,18 @@ def main(performance_config=None):
         'user_count': num_users,
         'next_item_sample_count': len(next_item_samples),
         'balanced_sample_count': len(balanced_samples),
-        'training_strategy': 'pretrain_finetune'
+        'training_strategy': 'pretrain_finetune',
+        'primary_metric': 'purchase_recall@20',
+        'tiebreaker_metric': 'purchase_mrr',
+        'split_date': split_date,  # Save the train/test split date
+        'train_ratio': 0.91  # Save the train ratio used
     }
     
-    with open('model_info_pretrain_finetune.json', 'w') as f:
+    # Save model info to appropriate directory based on dataset
+    output_dir = 'output/model_info' if args.dataset == '13months' else 'output/model_info_2months'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    with open(os.path.join(output_dir, 'model_info_pretrain_finetune.json'), 'w') as f:
         json.dump(model_info, f, indent=2)
     
     print("\nFiles saved:")
@@ -772,6 +918,11 @@ if __name__ == "__main__":
     parser.add_argument('--mode', type=str, default='balanced', 
                         choices=['fastest', 'balanced', 'accurate', 'apple_silicon'],
                         help='Performance mode (default: balanced)')
+    parser.add_argument('--dataset', type=str, default='13months',
+                        choices=['13months', '2months'],
+                        help='Which dataset to use: 13months or 2months (default: 13months)')
+    parser.add_argument('--event-data', type=str, default=None,
+                        help='Path to event data file (overrides --dataset)')
     parser.add_argument('--batch-size', type=int, default=None,
                         help='Override batch size (default: determined by mode)')
     parser.add_argument('--pretrain-epochs', type=int, default=None,
@@ -819,4 +970,4 @@ if __name__ == "__main__":
         print(f"Overriding learning rate to {args.learning_rate}")
     
     # Start training with pre-train + fine-tune strategy
-    main(performance_config)
+    main(performance_config, dataset=args.dataset, event_data_path=args.event_data)

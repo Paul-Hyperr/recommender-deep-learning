@@ -91,7 +91,7 @@ class ModelComparator:
                 # Create a default config for models without embedded config
                 config_dict = {
                     'num_users': 751729,
-                    'num_packages': 8773, 
+                    'num_packages': 8774, 
                     'num_countries': 78,
                     'num_categories': 9,
                     'num_themes': 99,
@@ -154,12 +154,13 @@ class ModelComparator:
             print(f"✗ Failed to load {model_name}: {str(e)}")
             return False
     
-    def auto_discover_models(self, checkpoints_dir: str = "checkpoints/natr"):
+    def auto_discover_models(self, checkpoints_dir: str = "checkpoints/natr", dataset: str = "13months"):
         """
         Automatically discover and load trained models from checkpoints directory
         
         Args:
             checkpoints_dir: Directory containing model checkpoints
+            dataset: Dataset name (13months or 2months) to determine model_info directory
         """
         print(f"Auto-discovering models in {checkpoints_dir}...")
         
@@ -167,12 +168,21 @@ class ModelComparator:
             print(f"Checkpoints directory not found: {checkpoints_dir}")
             return
         
+        # Determine model_info directory based on dataset
+        if dataset == "2months":
+            model_info_dir = "output/model_info_2months"
+        else:
+            model_info_dir = "output/model_info"
+        
+        print(f"Looking for model_info files in: {model_info_dir}")
+        
         # Model checkpoint mappings with optional config files
         model_mappings = {
-            'Base NATR': ('best_model.pth', 'model_info.json'),
-            'Contrastive NATR': ('contrastive_best_model.pth', 'model_info_contrastive.json'),
-            'Pretrain-Finetune NATR': ('finetuned_model.pth', 'model_info_pretrain_finetune.json'),
-            'Checkout-Enhanced NATR': ('checkout_best_model.pth', 'model_info_checkout_enhanced.json')
+            'Base NATR': ('best_model.pth', f'{model_info_dir}/model_info.json'),
+            'Contrastive NATR': ('contrastive_best_model.pth', f'{model_info_dir}/model_info_contrastive.json'),
+            'Pretrain-Finetune NATR': ('finetuned_model.pth', f'{model_info_dir}/model_info_pretrain_finetune.json'),
+            'Checkout-Enhanced NATR': ('checkout_best_model.pth', f'{model_info_dir}/model_info_checkout_enhanced.json'),
+            'Neg-Sampling NATR': ('best_model_neg_sampling.pth', f'{model_info_dir}/model_info_neg_sampling.json')
         }
         
         # Try to load each model
@@ -386,6 +396,7 @@ class ModelComparator:
             if model_results:
                 # Print both @10 and @20 metrics
                 print(f"Overall Recall@10: {model_results.get('recall@10', 0)*100:.2f}% | Recall@20: {model_results.get('recall@20', 0)*100:.2f}%")
+                print(f"HitRate@20: {model_results.get('hit_rate@20', 0)*100:.2f}% | Item-coverage@20: {model_results.get('item_coverage@20', 0)*100:.2f}% | MRR@20: {model_results.get('mrr@20', 0)*100:.2f}%")
                 print(f"Purchase Recall@10: {model_results.get('purchase_recall@10', 0)*100:.2f}% | Recall@20: {model_results.get('purchase_recall@20', 0)*100:.2f}%")
                 print(f"InitiateCheckout Recall@10: {model_results.get('checkout_recall@10', 0)*100:.2f}% | Recall@20: {model_results.get('checkout_recall@20', 0)*100:.2f}%")
                 print(f"AddToCart Recall@10: {model_results.get('add_to_cart_recall@10', 0)*100:.2f}% | Recall@20: {model_results.get('add_to_cart_recall@20', 0)*100:.2f}%")
@@ -414,6 +425,9 @@ class ModelComparator:
         table_metrics = [
             ('recall@10', 'Overall R@10'),
             ('recall@20', 'Overall R@20'),
+            ('hit_rate@20', 'HitRate@20'),
+            ('item_coverage@20', 'ItemCov@20'),
+            ('mrr@20', 'MRR@20'),
             ('purchase_recall@10', 'Purchase R@10'),
             ('purchase_recall@20', 'Purchase R@20'),
             ('checkout_recall@10', 'Checkout R@10'),
@@ -434,9 +448,9 @@ class ModelComparator:
         
         # Create table header
         table_lines = []
-        table_lines.append("=" * 120)
+        table_lines.append("=" * 150)
         table_lines.append("MODEL EVALUATION METRICS COMPARISON TABLE")
-        table_lines.append("=" * 120)
+        table_lines.append("=" * 150)
         
         # Header row
         header = f"{'Model':<{model_name_width}}"
@@ -452,6 +466,7 @@ class ModelComparator:
             
             for metric_key, _ in table_metrics:
                 value = results.get(metric_key, 0)
+                # All metrics as percentages
                 formatted_value = f"{value*100:.1f}%"
                 row += f"{formatted_value:>{metric_width}}"
             
@@ -469,7 +484,7 @@ class ModelComparator:
         table_lines.append(f"{'Cold Start:':<{model_name_width}}{cold_samples:,} ({(cold_samples/total_samples)*100:.1f}%)")
         table_lines.append(f"{'Warm Start:':<{model_name_width}}{warm_samples:,} ({(warm_samples/total_samples)*100:.1f}%)")
         
-        table_lines.append("=" * 120)
+        table_lines.append("=" * 150)
         
         return "\n".join(table_lines)
     
@@ -913,12 +928,17 @@ def main():
                         help='Output file for the comparison report (default: output/training_comparison/)')
     parser.add_argument('--csv-export', type=str, default=None,
                         help='Export results to CSV file (default: output/training_comparison/)')
-    parser.add_argument('--k-values', type=int, nargs='+', default=[5, 10, 20],
+    parser.add_argument('--k-values', type=int, nargs='+', default=[10, 20],
                         help='K values for recall@k metrics')
     parser.add_argument('--test-mode', action='store_true',
                         help='Use small test dataset for quick evaluation')
     parser.add_argument('--max-batches', type=int, default=None,
                         help='Maximum number of batches to evaluate per model (for quick testing)')
+    parser.add_argument('--dataset', type=str, default='13months',
+                        choices=['13months', '2months'],
+                        help='Dataset to use: 13months or 2months')
+    parser.add_argument('--event-data', type=str, default=None,
+                        help='Path to event data parquet file (overrides --dataset)')
     
     args = parser.parse_args()
     
@@ -938,23 +958,35 @@ def main():
         os.environ["NATR_MAX_SAMPLES"] = "5000"  # Smaller for quick comparison
         print("*** TEST MODE: Using small dataset subset ***")
     
+    # Determine event data path
+    if args.event_data:
+        event_data_path = args.event_data
+    else:
+        dataset_map = {
+            '13months': 'data/bookit_events_data_13_months.parquet',
+            '2months': 'data/bookit_events_2_months.parquet'
+        }
+        event_data_path = dataset_map[args.dataset]
+    
+    print(f"Using event data: {event_data_path}")
+    
     # Initialize data processors (needed for evaluation)
     print("\nInitializing data processors...")
     
     package_processor = PackageProcessor(
-        data_path="data/feed.parquet",
+        feed_data_path="data/feed.parquet",
         cache_dir='data/cache',
         load_coordinates=True,
         load_embeddings=True,
         api_key=os.environ.get("OPENAI_API_KEY"),
         embedding_model='text-embedding-3-small',
-        use_reduced_embeddings=True
+        use_reduced_embeddings=True if device.type != 'cpu' else False
     )
     
     session_processor = SessionProcessor(
-        data_path="data/bookit_events_data_13_months.parquet",
+        event_data_path=event_data_path,
         cache_dir='data/cache',
-        min_interactions=10,
+        min_interactions=5,  # Same as training
         max_sessions_per_user=20,
         max_samples_per_user=10
     )
@@ -975,13 +1007,30 @@ def main():
         samples = limit_samples_for_testing(samples)  # Apply test mode limiting if enabled
         
         # Apply same filters as training
-        quality_samples = filter_by_min_session_length(samples, min_session_length=3)
-        filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=50)
+        quality_samples = filter_by_min_session_length(samples, min_session_length=2)  # Same as training
+        filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=5)  # Same as training
         
         # Use the test split
-        train_samples, test_samples = time_based_split_year(filtered_samples, train_ratio=0.93)
+        train_samples, test_samples = time_based_split_year(filtered_samples, train_ratio=0.91)
         
         print(f"Test dataset: {len(test_samples):,} samples")
+        
+        # IMPORTANT: Update user mappings to include ALL users from both train and test sets
+        print("\nUpdating user mappings to include test users...")
+        all_users = set()
+        for sample in train_samples + test_samples:
+            all_users.add(sample['user_id'])
+        
+        # Check if we have unmapped users
+        unmapped_users = all_users - set(session_processor.user_to_idx.keys())
+        if unmapped_users:
+            print(f"Found {len(unmapped_users)} unmapped users (likely from test set)")
+            # Add them to the mapping
+            max_idx = max(session_processor.user_to_idx.values()) if session_processor.user_to_idx else 0
+            for user_id in unmapped_users:
+                max_idx += 1
+                session_processor.user_to_idx[user_id] = max_idx
+            print(f"Updated user mappings. Total users: {len(session_processor.user_to_idx)}")
         
         # Pre-compute event flags for consistent evaluation across all models
         event_to_idx = session_processor.get_idx_mappings()['event_to_idx']
@@ -1002,7 +1051,7 @@ def main():
     comparator = ModelComparator(device=device, k_values=args.k_values)
     
     # Auto-discover and load models
-    comparator.auto_discover_models(args.checkpoints_dir)
+    comparator.auto_discover_models(args.checkpoints_dir, dataset=args.dataset)
     
     if not comparator.models:
         print("No models found to compare. Make sure you have trained models in the checkpoints directory.")

@@ -14,13 +14,21 @@ import time
 import json
 import glob
 from datetime import datetime
-from tqdm import tqdm
 from collections import defaultdict, Counter
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.backends.cudnn as cudnn
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Configure tqdm to avoid terminal display issues
+os.environ['TQDM_DISABLE'] = '0'  # Ensure tqdm is enabled
+os.environ['TQDM_POSITION'] = '0'  # Set default position
+
+# Import tqdm and configure it to handle terminal clearing better
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="tqdm")
 
 # Enable optimization settings
 cudnn.benchmark = True
@@ -31,7 +39,116 @@ if hasattr(torch, 'set_float32_matmul_precision'):
 from models.natr import NATR, NATRConfig
 from utils.session_processor import SessionProcessor
 from utils.package_processor import PackageProcessor
-from utils.loss_functions import ContrastiveEventLoss, EnhancedEventMetrics
+from utils.loss_functions import EnhancedEventMetrics
+import torch.nn.functional as F
+
+
+class PurchaseFocusedLoss(nn.Module):
+    """
+    Loss function that ONLY optimizes for purchase prediction with comprehensive anti-overfitting measures
+    Prevents popularity bias and encourages item coverage diversity
+    """
+    def __init__(self, k=20, margin=1.0, regularization_weight=0.01, item_frequencies=None):
+        super().__init__()
+        self.k = k
+        self.margin = margin
+        self.regularization_weight = regularization_weight
+        
+        # Store item frequencies for popularity bias prevention
+        if item_frequencies is not None:
+            # Normalize frequencies to create popularity weights
+            total_freq = item_frequencies.sum()
+            self.register_buffer('popularity_weights', item_frequencies / total_freq)
+        else:
+            self.popularity_weights = None
+            
+        # Track which items are being predicted to measure coverage
+        self.predicted_items = set()
+        
+    def forward(self, predictions, targets, is_purchase, has_checkout=None, has_add_to_cart=None):
+        """
+        Ranking loss ONLY for purchase samples + comprehensive overfitting prevention
+        """
+        device = predictions.device
+        
+        if targets.numel() == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # ONLY optimize for purchase samples - let model learn event influence organically
+        purchase_mask = is_purchase
+        
+        if not purchase_mask.any():
+            # No purchases in batch - use small regularization loss only
+            return torch.tensor(self.regularization_weight, device=device, requires_grad=True)
+        
+        # Get purchase samples only
+        purchase_indices = purchase_mask.nonzero(as_tuple=True)[0]
+        purchase_predictions = predictions[purchase_indices]
+        purchase_targets = targets[purchase_indices].long()  # Convert to int64 for gather
+        
+        # Get target scores for purchase samples
+        target_scores = torch.gather(purchase_predictions, 1, purchase_targets.unsqueeze(1)).squeeze(1)
+        
+        # Get K-th highest scores as thresholds
+        top_k_scores, _ = torch.topk(purchase_predictions, self.k, dim=1)
+        kth_scores = top_k_scores[:, -1]  # K-th highest score
+        
+        # Ranking loss: purchase targets should be in top-K
+        purchase_loss = F.relu(kth_scores - target_scores + self.margin)
+        
+        # === COMPREHENSIVE ANTI-OVERFITTING REGULARIZATION ===
+        
+        # 1. Prediction diversity: prevent all predictions becoming similar
+        pred_std = torch.std(predictions, dim=1).mean()
+        diversity_loss = F.relu(0.5 - pred_std)  # Encourage std > 0.5
+        
+        # 2. Item coverage: penalize if only predicting same items repeatedly
+        with torch.no_grad():
+            # Track top predicted items to measure coverage
+            _, top_items = torch.topk(predictions, self.k, dim=1)
+            for batch_top_items in top_items:
+                for item in batch_top_items:
+                    self.predicted_items.add(item.item())
+        
+        # Coverage regularization: encourage diverse item predictions
+        num_unique_predictions = len(self.predicted_items)
+        total_items = predictions.size(1)
+        coverage_ratio = num_unique_predictions / total_items
+        coverage_loss = F.relu(torch.tensor(0.3 - coverage_ratio, device=device))  # Encourage >30% item coverage
+        
+        # 3. Popularity bias prevention: penalize over-relying on popular items
+        popularity_loss = torch.tensor(0.0, device=device)
+        if self.popularity_weights is not None:
+            # Get top-k predicted items and their popularity weights
+            _, top_predicted = torch.topk(predictions, self.k, dim=1)
+            
+            # Calculate average popularity of predicted items
+            batch_popularity = torch.tensor(0.0, device=device)
+            for batch_idx in range(top_predicted.size(0)):
+                item_popularities = self.popularity_weights[top_predicted[batch_idx]]
+                batch_popularity += item_popularities.mean()
+            
+            avg_popularity = batch_popularity / top_predicted.size(0)
+            # Penalize if average popularity is too high (>0.1 = top 10% of items)
+            popularity_loss = F.relu(avg_popularity - 0.1)
+        
+        # 4. Reset prediction tracking periodically to avoid memory growth
+        if len(self.predicted_items) > 10000:  # Reset every ~10k items
+            self.predicted_items.clear()
+        
+        # Combine all losses
+        total_loss = (purchase_loss.mean() + 
+                     self.regularization_weight * diversity_loss +
+                     self.regularization_weight * coverage_loss +
+                     self.regularization_weight * popularity_loss)
+        
+        return total_loss
+from utils.unified_metrics import UnifiedMetricsTracker
+from utils.memory_utils import (
+    detect_device, create_memory_config, MemoryOptimizer, AMPManager, 
+    GradientAccumulator, get_optimal_batch_size, print_memory_stats,
+    create_optimizer_with_memory_optimizations, get_model_size
+)
 
 # Import consolidated utilities
 from utils.training_utils import (
@@ -49,6 +166,81 @@ from utils.training_utils import (
     clear_memory,
     limit_samples_for_testing
 )
+
+# Import the enhanced evaluation function from train_natr.py
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from train_natr import evaluate_with_unified_metrics
+
+
+def analyze_learned_event_weights(model, test_loader, device, max_batches=10):
+    """
+    Analyze what event influence weights the model has learned
+    by comparing prediction scores for different event types
+    """
+    model.eval()
+    
+    event_scores = {
+        'purchase': [],
+        'checkout': [], 
+        'addtocart': [],
+        'view': []
+    }
+    
+    with torch.no_grad():
+        batch_count = 0
+        for batch in test_loader:
+            if batch_count >= max_batches:
+                break
+                
+            batch = move_batch_to_device(batch, device)
+            outputs = model(batch)
+            predictions = outputs['predictions']
+            
+            # Get event type flags
+            is_purchase = batch.get('is_purchase', torch.zeros(len(predictions), dtype=torch.bool))
+            has_checkout = batch.get('has_checkout', torch.zeros(len(predictions), dtype=torch.bool))
+            has_add_to_cart = batch.get('has_add_to_cart', torch.zeros(len(predictions), dtype=torch.bool))
+            
+            # Get target scores for each event type
+            targets = batch['purchased']['package_ids']
+            
+            for i in range(len(predictions)):
+                if i < len(targets):
+                    target_idx = targets[i].item()
+                    if 0 <= target_idx < predictions.size(1):
+                        target_score = predictions[i, target_idx].item()
+                        
+                        # Categorize by event type (exclusive categories)
+                        if is_purchase[i]:
+                            event_scores['purchase'].append(target_score)
+                        elif has_checkout[i]:
+                            event_scores['checkout'].append(target_score)
+                        elif has_add_to_cart[i]:
+                            event_scores['addtocart'].append(target_score)
+                        else:
+                            event_scores['view'].append(target_score)
+            
+            batch_count += 1
+    
+    # Calculate average scores and relative weights
+    avg_scores = {}
+    for event_type, scores in event_scores.items():
+        if scores:
+            avg_scores[event_type] = sum(scores) / len(scores)
+        else:
+            avg_scores[event_type] = 0.0
+    
+    # Calculate relative influence weights (normalize to purchase = 100%)
+    purchase_score = avg_scores.get('purchase', 1.0)
+    if purchase_score > 0:
+        relative_weights = {
+            event_type: (score / purchase_score) * 100 
+            for event_type, score in avg_scores.items()
+        }
+    else:
+        relative_weights = {event_type: 0.0 for event_type in avg_scores.keys()}
+    
+    return avg_scores, relative_weights, event_scores
 
 
 class ContrastiveAwareDataset(torch.utils.data.Dataset):
@@ -136,10 +328,10 @@ def create_contrastive_dataloaders(train_samples, test_samples, package_processo
         view_count = len(train_samples) - purchase_count - checkout_count - add_to_cart_count
         
         # Set weights for different sample types
-        purchase_boost = 15.0    # Very high weight for actual purchases
-        checkout_boost = 7.5     # Medium-high weight for checkouts
-        add_to_cart_boost = 3.0  # Medium weight for add-to-cart
-        view_weight = 1.0        # Base weight for regular browsing
+        purchase_boost = 10.0    # High weight for actual purchases (consistent with other scripts)
+        checkout_boost = 5.0     # Medium-high weight for checkouts
+        add_to_cart_boost = 2.0  # Medium weight for add-to-cart
+        view_weight = 0.5        # Base weight for regular browsing
         
         # Calculate weights for each sample based on event type hierarchy
         sample_weights = []
@@ -217,8 +409,11 @@ def evaluate_with_enhanced_metrics(model, test_loader, device, k_values=[5, 10, 
         
         # Use smaller batches for evaluation on MPS to avoid OOM
         progress_bar = tqdm(test_loader, desc="Evaluating",
-                           mininterval=10.0,  # Update at most every 10 seconds
-                           miniters=1000)     # Update after at least 1000 iterations
+                           mininterval=2.0,   # Update at most every 2 seconds
+                           miniters=5,        # Update after at least 5 iterations
+                           ncols=80,          # Fixed width to prevent wrapping
+                           leave=False,       # Don't keep evaluation progress bar
+                           position=1)        # Position below training bar
         
         for batch_idx, batch in enumerate(progress_bar):
             # Move batch to device
@@ -233,10 +428,14 @@ def evaluate_with_enhanced_metrics(model, test_loader, device, k_values=[5, 10, 
             is_purchase = batch.get('is_purchase', torch.zeros_like(targets, dtype=torch.bool))
             has_checkout = batch.get('has_checkout', torch.zeros_like(targets, dtype=torch.bool))
             has_add_to_cart = batch.get('has_add_to_cart', torch.zeros_like(targets, dtype=torch.bool))
+            # Get inclusive flags for individual event recall calculations
+            has_checkout_inclusive = batch.get('has_checkout_inclusive', torch.zeros_like(targets, dtype=torch.bool))
+            has_add_to_cart_inclusive = batch.get('has_add_to_cart_inclusive', torch.zeros_like(targets, dtype=torch.bool))
             
             # Calculate comprehensive metrics using the EnhancedEventMetrics specialized implementation
             batch_metrics = EnhancedEventMetrics.calculate_metrics(
-                predictions, targets, is_purchase, has_checkout, has_add_to_cart, k_values
+                predictions, targets, is_purchase, has_checkout, has_add_to_cart, k_values,
+                has_checkout_inclusive=has_checkout_inclusive, has_add_to_cart_inclusive=has_add_to_cart_inclusive
             )
             
             # Accumulate counts
@@ -356,50 +555,56 @@ def get_contrastive_config(mode="balanced"):
     if mode == "apple_silicon" or (mode == "balanced" and is_mps):
         # Contrastive margin parameters optimized for Apple Silicon
         config.update({
-            # Contrastive margin parameters
-            "temperature": 0.1,                  # Contrastive temperature - lower = sharper distinctions
-            "purchase_margin": 0.0,              # No margin for purchases (strongest signal)
-            "checkout_margin": 0.3,              # Small margin for checkouts (medium signal)
-            "add_to_cart_margin": 0.6,           # Medium margin for add-to-cart events
-            "view_margin": 1.0,                  # Full margin for view events (weakest signal)
+            # Contrastive margin parameters (negative margins boost logits)
+            "temperature": 0.07,                 # Sharp learning for event combinations
+            "purchase_margin": -0.8,             # Strong negative boost for purchases
+            "checkout_margin": -0.3,             # Medium negative boost for checkouts
+            "add_to_cart_margin": 0.0,           # Neutral margin for add-to-cart
+            "view_margin": 0.2,                  # Small penalty for views
             "hard_negative_ratio": 0.7           # Proportion of hard negatives to keep
         })
     elif mode == "fastest":
         # Contrastive margin parameters - less aggressive for faster convergence
         config.update({
-            "temperature": 0.2,                  # Higher temperature = smoother distinctions
-            "purchase_margin": 0.0,              # No margin for purchases
-            "checkout_margin": 0.2,              # Smaller checkout margin for faster convergence
-            "add_to_cart_margin": 0.4,           # Smaller add-to-cart margin
-            "view_margin": 0.8,                  # Smaller view margin
+            "temperature": 0.15,                 # Moderate temperature
+            "purchase_margin": -0.5,             # Moderate negative boost for purchases
+            "checkout_margin": -0.2,             # Small negative boost for checkouts
+            "add_to_cart_margin": 0.0,           # No margin for add-to-cart
+            "view_margin": 0.1,                  # Smaller penalty for views
             "hard_negative_ratio": 0.5           # Fewer hard negatives for faster training
         })
     elif mode == "accurate":
         # Contrastive margin parameters - more aggressive for better accuracy
         config.update({
-            "temperature": 0.05,                 # Lower temperature = sharper distinctions
-            "purchase_margin": 0.0,              # No margin for purchases
-            "checkout_margin": 0.25,             # Precise checkout margin
-            "add_to_cart_margin": 0.5,           # Precise add-to-cart margin
-            "view_margin": 1.0,                  # Full margin for views
+            "temperature": 0.05,                 # Very sharp learning
+            "purchase_margin": -1.0,             # Very strong negative boost for purchases
+            "checkout_margin": -0.4,             # Strong negative boost for checkouts
+            "add_to_cart_margin": 0.0,           # No margin for add-to-cart
+            "view_margin": 0.3,                  # Standard penalty for views
             "hard_negative_ratio": 0.8           # More hard negatives for better discrimination
         })
     else:  # "balanced" mode (non-MPS)
         # Contrastive margin parameters - balanced configuration
         config.update({
-            "temperature": 0.1,                  # Balanced temperature
-            "purchase_margin": 0.0,              # No margin for purchases
-            "checkout_margin": 0.3,              # Standard checkout margin
-            "add_to_cart_margin": 0.6,           # Standard add-to-cart margin
-            "view_margin": 1.0,                  # Standard view margin
+            "temperature": 0.07,                 # Sharp learning for event combinations
+            "purchase_margin": -0.8,             # Strong negative boost for purchases
+            "checkout_margin": -0.3,             # Medium negative boost for checkouts
+            "add_to_cart_margin": 0.0,           # No margin for add-to-cart
+            "view_margin": 0.2,                  # Small penalty for views
             "hard_negative_ratio": 0.7           # Standard hard negative ratio
         })
     
     return config
 
 
-def main(performance_config=None):
-    """Main function implementing contrastive learning with event-based margins"""
+def main(performance_config=None, dataset="13months", event_data_path=None):
+    """Main function implementing contrastive learning with event-based margins
+    
+    Args:
+        performance_config: Performance configuration dict
+        dataset (str): Dataset to use - '13months' or '2months'
+        event_data_path (str): Optional explicit path to event data file
+    """
     # Set device - for Apple Silicon (M1/M2/M3), we can use MPS
     if torch.cuda.is_available():
         device = torch.device('cuda')
@@ -435,12 +640,29 @@ def main(performance_config=None):
     
     # Data paths
     package_data_path = "data/feed.parquet"
-    event_data_path = "data/bookit_events_data_13_months.parquet"
+    
+    # Determine event data path
+    if event_data_path is None:
+        # Map dataset selection to file path
+        dataset_map = {
+            '13months': 'data/bookit_events_data_13_months.parquet',
+            '2months': 'data/bookit_events_2_months.parquet'
+        }
+        
+        event_data_path = dataset_map.get(dataset)
+        if not event_data_path:
+            raise ValueError(f"Unknown dataset: {dataset}. Use '13months' or '2months'")
+        
+        # Check if file exists
+        if not os.path.exists(event_data_path):
+            raise FileNotFoundError(f"Event data file not found: {event_data_path}")
+    
+    print(f"Using event data: {event_data_path}")
     
     # Initialize processors
     print("\nInitializing data processors...")
     package_processor = PackageProcessor(
-        data_path=package_data_path,
+        feed_data_path=package_data_path,  # Updated parameter name
         cache_dir='data/cache',
         load_coordinates=True,
         load_embeddings=True,
@@ -450,9 +672,9 @@ def main(performance_config=None):
     )
     
     session_processor = SessionProcessor(
-        data_path=event_data_path,
+        event_data_path=event_data_path,  # Updated parameter name
         cache_dir='data/cache',
-        min_interactions=10,  # Users must have at least 10 interactions
+        min_interactions=5,
         max_sessions_per_user=20,
         max_samples_per_user=10
     )
@@ -523,10 +745,10 @@ def main(performance_config=None):
     print("\n7. Applying data filters...")
     
     # Apply session length filtering - quality improves with longer sessions
-    quality_samples = filter_by_min_session_length(enhanced_samples, min_session_length=3)
+    quality_samples = filter_by_min_session_length(enhanced_samples, min_session_length=2)  # Reduced from 3
     
     # Filter items by frequency - focus on packages with sufficient data
-    filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=50)
+    filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=5)  # Reduced from 10
     
     # Validate that we have different event types
     purchase_count = sum(1 for s in filtered_samples if s.get('is_purchase', False))
@@ -544,12 +766,29 @@ def main(performance_config=None):
           f"({(purchase_count + checkout_count + add_to_cart_count) / len(filtered_samples) * 100:.2f}% of all events)")
     
     # Time-based split
-    train_samples, test_samples = time_based_split_year(filtered_samples, train_ratio=0.93)
+    train_samples, test_samples, split_date = time_based_split_year(filtered_samples, train_ratio=0.91)
     
     # Ensure evaluation set has enough events of each type for meaningful metrics
     train_samples, test_samples = ensure_balanced_test_set(
         train_samples, test_samples, min_purchases=50
     )
+    
+    # IMPORTANT: Update user mappings to include ALL users from both train and test sets
+    print("\n7b. Updating user mappings to include test users...")
+    all_users = set()
+    for sample in train_samples + test_samples:
+        all_users.add(sample['user_id'])
+    
+    # Check if we have unmapped users
+    unmapped_users = all_users - set(session_processor.user_to_idx.keys())
+    if unmapped_users:
+        print(f"Found {len(unmapped_users)} unmapped users (likely from test set)")
+        # Add them to the mapping
+        max_idx = max(session_processor.user_to_idx.values()) if session_processor.user_to_idx else 0
+        for user_id in unmapped_users:
+            max_idx += 1
+            session_processor.user_to_idx[user_id] = max_idx
+        print(f"Updated user mappings. Total users: {len(session_processor.user_to_idx)}")
     
     # Analyze distributions
     analyze_data_distribution(train_samples, "Train")
@@ -615,13 +854,67 @@ def main(performance_config=None):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
     
-    # Initialize optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=0.05,  # Increased weight decay for stronger regularization (from 0.03)
-        eps=1e-8  # More stable epsilon value
-    )
+    # Initialize popularity bias based on item frequencies
+    print("Initializing popularity bias...")
+    # Calculate item frequencies from training data
+    item_counts = Counter()
+    for sample in train_samples:
+        # Count all packages in sessions
+        for pkg in sample.get('short_term_packages', []):
+            if pkg is not None:
+                item_counts[pkg] += 1
+        for pkg in sample.get('long_term_packages', []):
+            if pkg is not None:
+                item_counts[pkg] += 1
+        # Count purchased package
+        purchased = sample.get('purchased_package')
+        if purchased is not None:
+            item_counts[purchased] += 1
+    
+    # Create frequency tensor for all packages
+    item_frequencies = torch.zeros(config.num_packages, device=device)
+    for package_id_str, count in item_counts.items():
+        # Convert package ID to index
+        package_idx = session_processor.package_to_idx.get(str(package_id_str), 0)
+        if package_idx < config.num_packages:
+            item_frequencies[package_idx] = count
+    
+    # Skip popularity initialization to test if it hurts contrastive learning on large data
+    # model.initialize_popularity(item_frequencies)  # DISABLED for testing
+    print(f"Skipping popularity initialization - testing pure contrastive learning")
+    
+    # Initialize optimizer with enhanced user learning (multi-rate optimization)
+    print("Creating custom optimizer with enhanced user learning...")
+    
+    # Separate parameters for different learning rates
+    user_params = []
+    user_transform_params = []
+    other_params = []
+    
+    for name, param in model.named_parameters():
+        if 'user_encoder.user_embedding' in name:
+            user_params.append(param)
+        elif 'user_transform' in name:
+            user_transform_params.append(param)
+        else:
+            other_params.append(param)
+    
+    # Create optimizer with different learning rates for enhanced user learning
+    user_lr = learning_rate * 2.0  # 2x learning rate for user embeddings
+    user_transform_lr = learning_rate * 10.0  # 10x learning rate for user transform
+    
+    optimizer = optim.AdamW([
+        {'params': other_params, 'lr': learning_rate, 'weight_decay': 1e-4},
+        {'params': user_params, 'lr': user_lr, 'weight_decay': 1e-5},  # Less regularization for users
+        {'params': user_transform_params, 'lr': user_transform_lr, 'weight_decay': 1e-5}
+    ], eps=1e-8)
+    
+    print(f"  Base learning rate: {learning_rate}")
+    print(f"  User embedding learning rate: {user_lr}")
+    print(f"  User transform learning rate: {user_transform_lr}")
+    print(f"  User embedding params: {sum(p.numel() for p in user_params)}")
+    print(f"  User transform params: {sum(p.numel() for p in user_transform_params)}")
+    print(f"  Other params: {sum(p.numel() for p in other_params)}")
     
     # Use a simple step scheduler with no warmup
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -633,16 +926,23 @@ def main(performance_config=None):
         min_lr=1e-6           # Minimum learning rate
     )
     
-    # Create contrastive loss function with margin-based event learning
-    loss_fn = ContrastiveEventLoss(
-        temperature=performance_config.get("temperature", 0.1),
-        purchase_margin=performance_config.get("purchase_margin", 0.0),
-        checkout_margin=performance_config.get("checkout_margin", 0.3),
-        add_to_cart_margin=performance_config.get("add_to_cart_margin", 0.6),
-        view_margin=performance_config.get("view_margin", 1.0),
-        hard_negative_mining=True,
-        hard_negative_ratio=performance_config.get("hard_negative_ratio", 0.7)
+    # Use PurchaseFocusedLoss with comprehensive anti-overfitting measures
+    loss_fn = PurchaseFocusedLoss(
+        k=20,                     # Optimize for top-20 performance (matches evaluation)
+        margin=1.0,               # Ranking margin for purchase samples
+        regularization_weight=0.01,  # Anti-overfitting regularization
+        item_frequencies=item_frequencies  # For popularity bias prevention
     )
+    print(f"Using PurchaseFocusedLoss - Pure purchase optimization with comprehensive overfitting prevention:")
+    print(f"  Target: ONLY purchase samples optimized for top-20 ranking")
+    print(f"  NO hardcoded weights for checkout/addtocart/view events")
+    print(f"  Model learns event influence organically through purchase examples")
+    print(f"  🛡️  Anti-overfitting measures:")
+    print(f"    • Prediction diversity: Prevents similar predictions across features")
+    print(f"    • Item coverage: Encourages >30% of catalog to be recommended")  
+    print(f"    • Popularity bias prevention: Penalizes over-recommending popular items")
+    print(f"  → Loss decreases ⟺ Purchase Recall@20 increases + High item coverage")
+    print(f"  → Model discovers: which events predict purchases while maintaining diversity")
     
     # Print model configuration for debugging
     print(f"  Title embedding dimension: {config.title_embedding_dim}")
@@ -661,6 +961,7 @@ def main(performance_config=None):
             model = torch.compile(model, backend="inductor")
         else:
             print("Model compilation not supported on this device")
+    # Model compilation check complete
     
     # Training loop
     # Get performance parameters
@@ -671,8 +972,9 @@ def main(performance_config=None):
     print(f"Training for {num_epochs} epochs with contrastive margins")
     print(f"Early stopping patience: {early_stopping_patience} epochs")
     
-    # Track the metric we care about most - combined purchase+checkout+cart performance
-    best_combined_recall = 0
+    # Track the metric we care about most - Purchase Recall@20 with MRR as tiebreaker
+    best_purchase_recall_20 = 0
+    best_purchase_mrr = 0  # Track purchase MRR for tiebreaking
     epochs_without_improvement = 0
     history = {'train_loss': [], 'test_metrics': []}
     
@@ -688,40 +990,34 @@ def main(performance_config=None):
         )
         train_time = time.time() - start_time
         
-        # Evaluate with our specialized evaluation function
+        # Evaluate with unified metrics (includes item coverage)
         start_time = time.time()
-        test_metrics = evaluate_with_enhanced_metrics(model, test_loader, device, k_values=[5, 10, 20])
+        # Create simple memory optimizer for evaluation
+        memory_config = create_memory_config(device.type, "balanced")
+        memory_optimizer = MemoryOptimizer(device, memory_config)
+        test_metrics = evaluate_with_unified_metrics(model, test_loader, device, memory_optimizer, k_values=[5, 10, 20])
         eval_time = time.time() - start_time
         
-        # Calculate combined recall metric (purchase + checkout + add-to-cart), weighed by importance
+        # Calculate combined recall metric @20 (purchase + checkout + add-to-cart), weighed by importance
         # Purchase gets full weight, checkout gets 0.6 weight, add-to-cart gets 0.2 weight
-        purchase_recall = test_metrics.get('purchase_recall@k', {}).get(10, 0)
-        checkout_recall = test_metrics.get('checkout_recall@k', {}).get(10, 0)
-        cart_recall = test_metrics.get('add_to_cart_recall@k', {}).get(10, 0)
+        purchase_recall_20 = test_metrics.get('purchase_recall@20', 0)
+        checkout_recall_20 = test_metrics.get('checkout_recall@20', 0)
+        cart_recall_20 = test_metrics.get('add_to_cart_recall@20', 0)
         
-        # Get counts
-        purchase_count = test_metrics.get('purchase', 0)
-        checkout_count = test_metrics.get('checkout', 0)
-        cart_count = test_metrics.get('add_to_cart', 0)
+        # Also get @10 for display
+        purchase_recall_10 = test_metrics.get('purchase_recall@10', 0)
+        
+        # Get counts from the counts dictionary
+        counts = test_metrics.get('counts', {})
+        purchase_count = counts.get('purchase', 0)
+        checkout_count = counts.get('checkout', 0)
+        cart_count = counts.get('add_to_cart', 0)
         total_important = purchase_count + checkout_count + cart_count
         
-        # Weighted average based on relative importance and count
-        if total_important > 0:
-            purchase_weight = 1.0
-            checkout_weight = 0.6
-            cart_weight = 0.2
-            
-            purchase_contribution = purchase_recall * purchase_weight * purchase_count
-            checkout_contribution = checkout_recall * checkout_weight * checkout_count
-            cart_contribution = cart_recall * cart_weight * cart_count
-            
-            current_combined_recall = (purchase_contribution + checkout_contribution + cart_contribution) / \
-                                     (purchase_weight * purchase_count + checkout_weight * checkout_count + cart_weight * cart_count)
-        else:
-            current_combined_recall = 0
+        # Focus only on purchase metrics (simplified for purchase-focused training)
         
-        # Update scheduler with the combined metric
-        scheduler.step(current_combined_recall)
+        # Update scheduler with Purchase Recall@20 metric
+        scheduler.step(purchase_recall_20)
         
         # Store history
         history['train_loss'].append(train_loss)
@@ -732,24 +1028,59 @@ def main(performance_config=None):
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
         print(f"\nTest Metrics:")
-        print(f"  Overall Recall@10: {test_metrics['recall@k'][10]*100:.2f}%")
-        print(f"  Purchase Recall@10: {purchase_recall*100:.2f}%")
+        print(f"  Purchase Recall@10: {purchase_recall_10*100:.2f}%")
+        print(f"  Purchase Recall@20: {purchase_recall_20*100:.2f}%")
         
-        if 'checkout_recall@k' in test_metrics:
-            print(f"  Checkout Recall@10: {checkout_recall*100:.2f}%")
+        if checkout_count > 0:
+            print(f"  InitiateCheckout Recall@20: {checkout_recall_20*100:.2f}%")
         
-        if 'add_to_cart_recall@k' in test_metrics:
-            print(f"  Add-to-cart Recall@10: {cart_recall*100:.2f}%")
+        purchase_mrr = test_metrics.get('purchase_mrr', 0.0)
+        print(f"  Purchase MRR: {purchase_mrr:.4f}")
         
-        if 'intent_recall@k' in test_metrics:
-            print(f"  Intent (P+C) Recall@10: {test_metrics['intent_recall@k'][10]*100:.2f}%")
+        if 'item_coverage@20' in test_metrics:
+            print(f"  Item Coverage@20: {test_metrics['item_coverage@20']*100:.2f}%")
         
-        print(f"  Combined weighted Recall@10: {current_combined_recall*100:.2f}%")
-        print(f"  Purchase MRR: {test_metrics.get('purchase_mrr', 0):.4f}")
+        # Analyze learned event weights every few epochs
+        if (epoch + 1) % 3 == 0:  # Every 3 epochs
+            print(f"\n🧠 Analyzing Learned Event Influence Weights (Epoch {epoch+1}):")
+            try:
+                _, relative_weights, _ = analyze_learned_event_weights(model, test_loader, device, max_batches=5)
+                
+                print(f"  📊 Event Influence on Purchase Prediction:")
+                print(f"    Purchase events: {relative_weights.get('purchase', 0):.0f}% (baseline=100%)")
+                print(f"    Checkout events: {relative_weights.get('checkout', 0):.0f}% (influence on purchase)")
+                print(f"    AddToCart events: {relative_weights.get('addtocart', 0):.0f}% (influence on purchase)")
+                print(f"    ViewContent events: {relative_weights.get('view', 0):.0f}% (influence on purchase)")
+                
+                # Show if model is learning the expected hierarchy
+                checkout_ratio = relative_weights.get('checkout', 0) / max(relative_weights.get('view', 1), 1)
+                print(f"  🎯 Learned Ratios:")
+                print(f"    Checkout vs View influence: {checkout_ratio:.1f}x stronger")
+                
+                if relative_weights.get('view', 0) < 10:  # Less than 10% influence
+                    print(f"    ✅ ViewContent correctly learned as low influence ({relative_weights.get('view', 0):.1f}%)")
+                else:
+                    print(f"    ⚠️  ViewContent influence higher than expected ({relative_weights.get('view', 0):.1f}%)")
+                    
+            except Exception as e:
+                print(f"  ⚠️  Could not analyze event weights: {e}")
         
-        # Save best model based on our combined metric
-        if current_combined_recall > best_combined_recall:
-            best_combined_recall = current_combined_recall
+        # Save best model based on Purchase Recall@20 with MRR as tiebreaker
+        epsilon = 1e-6  # tolerance for considering recalls as similar
+        current_purchase_mrr = test_metrics.get('purchase_mrr', 0.0)
+        
+        improvement = False
+        if purchase_recall_20 > best_purchase_recall_20 + epsilon:
+            # Clear improvement in Purchase Recall@20
+            improvement = True
+        elif abs(purchase_recall_20 - best_purchase_recall_20) <= epsilon:
+            # Purchase Recall@20 is effectively the same, use MRR as tiebreaker
+            if current_purchase_mrr > best_purchase_mrr:
+                improvement = True
+        
+        if improvement:
+            best_purchase_recall_20 = purchase_recall_20
+            best_purchase_mrr = current_purchase_mrr
             epochs_without_improvement = 0
             
             # Save checkpoint
@@ -757,12 +1088,13 @@ def main(performance_config=None):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_combined_recall': best_combined_recall,
+                'best_purchase_recall_20': best_purchase_recall_20,
+                'best_purchase_mrr': best_purchase_mrr,
                 'config': config.__dict__,
                 'valid_packages': list(valid_packages),
                 'history': history,
                 'performance_config': performance_config,
-                'margins': loss_fn.get_margins(),
+                'loss_type': 'PurchaseFocusedLoss',
                 'timestamp': datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             }
             
@@ -772,7 +1104,7 @@ def main(performance_config=None):
             # Save to both a versioned file and the best model file
             torch.save(checkpoint, f"checkpoints/natr/contrastive_model_epoch_{epoch+1}.pth")
             torch.save(checkpoint, 'checkpoints/natr/contrastive_best_model.pth')
-            print(f"  ✓ New best model saved! Combined Recall@10: {best_combined_recall*100:.2f}%")
+            print(f"  ✓ New best model saved! Purchase Recall@20: {best_purchase_recall_20*100:.2f}%, Purchase MRR: {best_purchase_mrr:.4f}")
         else:
             epochs_without_improvement += 1
             print(f"  No improvement for {epochs_without_improvement} epochs")
@@ -783,7 +1115,8 @@ def main(performance_config=None):
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                    'best_combined_recall': best_combined_recall,
+                    'best_purchase_recall_20': best_purchase_recall_20,
+                    'best_purchase_mrr': best_purchase_mrr,
                     'config': config.__dict__,
                     'valid_packages': list(valid_packages),
                     'history': history,
@@ -801,25 +1134,35 @@ def main(performance_config=None):
     
     # Final summary
     print("\n11. Training complete!")
-    print(f"Best Combined Recall@10: {best_combined_recall*100:.2f}%")
+    print(f"Best Purchase Recall@20: {best_purchase_recall_20*100:.2f}%")
+    print(f"Best Purchase MRR: {best_purchase_mrr:.4f}")
     
     # Save model info
     model_info = {
         'config': config.__dict__,
         'valid_packages': list(valid_packages),
-        'best_combined_recall': best_combined_recall,
+        'best_purchase_recall_20': best_purchase_recall_20,
+        'best_purchase_mrr': best_purchase_mrr,
         'checkpoint_path': 'checkpoints/natr/contrastive_best_model.pth',
         'package_data_path': package_data_path,
         'event_data_path': event_data_path,
         'performance_config': performance_config,
-        'contrastive_margins': loss_fn.get_margins(),
+        'loss_function': 'PurchaseFocusedLoss',
         'training_date': datetime.now().strftime("%Y-%m-%d"),
         'package_count': len(valid_packages),
         'user_count': num_users,
-        'training_strategy': 'contrastive_learning'
+        'training_strategy': 'contrastive_learning_enhanced',
+        'primary_metric': 'purchase_recall@20',
+        'tiebreaker_metric': 'purchase_mrr',
+        'split_date': split_date,  # Save the train/test split date
+        'train_ratio': 0.91  # Save the train ratio used
     }
     
-    with open('model_info_contrastive.json', 'w') as f:
+    # Save model info to appropriate directory based on dataset
+    output_dir = 'output/model_info' if args.dataset == '13months' else 'output/model_info_2months'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    with open(os.path.join(output_dir, 'model_info_contrastive.json'), 'w') as f:
         json.dump(model_info, f, indent=2)
     
     print("\nFiles saved:")
@@ -837,6 +1180,11 @@ if __name__ == "__main__":
     parser.add_argument('--mode', type=str, default='balanced', 
                         choices=['fastest', 'balanced', 'accurate', 'apple_silicon'],
                         help='Performance mode (default: balanced)')
+    parser.add_argument('--dataset', type=str, default='13months',
+                        choices=['13months', '2months'],
+                        help='Which dataset to use: 13months or 2months (default: 13months)')
+    parser.add_argument('--event-data', type=str, default=None,
+                        help='Path to event data file (overrides --dataset)')
     parser.add_argument('--batch-size', type=int, default=None,
                         help='Override batch size (default: determined by mode)')
     parser.add_argument('--epochs', type=int, default=None,
@@ -908,4 +1256,4 @@ if __name__ == "__main__":
         print(f"Overriding learning rate to {args.learning_rate}")
     
     # Start training with contrastive learning
-    main(performance_config)
+    main(performance_config, dataset=args.dataset, event_data_path=args.event_data)
