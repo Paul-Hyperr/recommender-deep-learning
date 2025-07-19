@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
 """
-Independent Model Performance Verification Script
+Verify NATR Enhanced Model Performance on Unseen Test Data
 
-This script provides a completely different approach to evaluate the model performance
-to verify the 46.18% Purchase Recall@20 result from evaluate_recommendations.py.
-
-Key differences from evaluate_recommendations.py:
-1. Direct model loading and inference (no NATRRecommender wrapper)
-2. Manual data processing and batching
-3. Simple, transparent metric calculation
-4. Detailed sample-by-sample analysis
-5. Different random sampling approach
-6. Cross-validation with multiple random seeds
-
-Usage:
-    python verify_model_performance.py --model-info output/model_info/model_info_pretrain_finetune_46_18.json
+This script evaluates how well the model ranks unseen purchases in the test data,
+without availability filtering or purchase exclusion. It also provides warm/cold
+start analysis and detailed examples of 3 warm-start users.
 """
 
 import argparse
@@ -23,29 +13,28 @@ import sys
 import os
 import numpy as np
 import torch
-import torch.nn.functional as F
 import pandas as pd
-import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 from tqdm import tqdm
+from collections import defaultdict
 import random
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.natr import NATR, NATRConfig
-from utils.session_processor import SessionProcessor
-from utils.package_processor import PackageProcessor
+from models.natr_enhanced import NATREnhanced, NATRConfig
+from utils.unified_metrics import UnifiedMetricsTracker
 from utils.training_utils import (
+    extract_test_events_from_parquet, create_dataloaders, 
     filter_by_min_session_length, filter_items_by_frequency,
-    identify_event_types, time_based_split_year
+    identify_event_types, analyze_data_distribution, time_based_split_year
 )
+from utils.session_processor2 import SessionProcessor2
+from utils.package_processor import PackageProcessor
 
 
-class IndependentModelVerifier:
-    """
-    Independent model performance verifier using a different approach
-    """
+class ModelPerformanceVerifier:
+    """Verify model performance on unseen test data with detailed analysis"""
     
     def __init__(self, model_info_path: str):
         """Initialize verifier"""
@@ -55,56 +44,64 @@ class IndependentModelVerifier:
         with open(model_info_path, 'r') as f:
             self.model_info = json.load(f)
         
-        print(f"🔍 Independent Verification of: {os.path.basename(model_info_path)}")
+        print(f"Verifying model: {os.path.basename(model_info_path)}")
+        print(f"Model type: {self.model_info.get('model_type', 'unknown')}")
         print(f"Training strategy: {self.model_info.get('training_strategy', 'standard')}")
+        print(f"Best Purchase Recall@20: {self.model_info.get('best_purchase_recall@20', 0)*100:.2f}%")
         
-        # Device setup
+        # Get split info
+        self.train_ratio = self.model_info.get('train_ratio', 0.91)
+        self.split_date = self.model_info.get('split_date', None)
+        
+        # Device
         self.device = torch.device('cuda' if torch.cuda.is_available() 
                                   else 'mps' if torch.backends.mps.is_available() 
                                   else 'cpu')
         print(f"Using device: {self.device}")
         
-        # Initialize components
-        self.model = None
-        self.package_processor = None
-        self.session_processor = None
-        self.test_samples = None
-        
-    def load_model_directly(self):
-        """Load model directly from checkpoint"""
-        print("\n📦 Loading model directly from checkpoint...")
-        
-        checkpoint_path = self.model_info['checkpoint_path']
+        # Load the enhanced model directly from checkpoint
+        print("\nLoading enhanced model from checkpoint...")
+        checkpoint_path = 'checkpoints/natr_enhanced/finetuned_model.pth'
         if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+            raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
         
-        # Load checkpoint
-        print(f"Loading checkpoint: {checkpoint_path}")
+        # Create model config from model_info
+        config = NATRConfig(
+            num_users=self.model_info['config']['num_users'],
+            num_packages=self.model_info['config']['num_packages'],
+            num_countries=self.model_info['config']['num_countries'],
+            num_categories=self.model_info['config']['num_categories'],
+            num_themes=self.model_info['config']['num_themes'],
+            title_embedding_dim=self.model_info['config']['title_embedding_dim'],
+            hidden_dim=self.model_info['config']['hidden_dim'],
+            embedding_dim=self.model_info['config']['embedding_dim'],
+            user_embedding_dim=self.model_info['config']['user_embedding_dim'],
+            dropout=self.model_info['config']['dropout'],
+            max_short_term=self.model_info['config']['max_short_term'],
+            max_long_term=self.model_info['config']['max_long_term']
+        )
+        
+        # Initialize and load model
+        self.model = NATREnhanced(config)
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        # Create config
-        config_dict = self.model_info['config']
-        config = NATRConfig(**config_dict)
-        
-        # Create and load model
-        self.model = NATR(config).to(self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.to(self.device)
         self.model.eval()
         
-        print(f"✅ Model loaded successfully")
-        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        
-    def prepare_data_independently(self, sample_size: Optional[int] = None):
-        """Prepare test data using independent approach"""
-        print("\n📊 Preparing test data independently...")
+        print(f"Model loaded successfully from {checkpoint_path}")
+        print(f"Model performance from checkpoint: Recall@20: {checkpoint.get('best_recall_20', 'N/A')}")
+    
+    def prepare_test_data(self) -> Tuple[List[Dict], List[Dict], Dict, Dict]:
+        """Prepare test data efficiently by reusing cached data when possible"""
+        print("\nPreparing test data (checking for cached data)...")
         
         # Data paths
-        event_data_path = self.model_info.get('event_data_path', 'data/bookit_events_data_13_months.parquet')
+        event_data = self.model_info.get('event_data_path', 'data/13_months_new2_clean.parquet')
         package_data_path = self.model_info.get('package_data_path', 'data/feed.parquet')
         
-        # Initialize processors
-        print("Initializing processors...")
-        self.package_processor = PackageProcessor(
+        # Initialize processors exactly like training script
+        print("Initializing data processors...")
+        package_processor = PackageProcessor(
             feed_data_path=package_data_path,
             cache_dir='data/cache',
             load_coordinates=True,
@@ -114,462 +111,535 @@ class IndependentModelVerifier:
             use_reduced_embeddings=True
         )
         
-        self.session_processor = SessionProcessor(
-            event_data_path=event_data_path,
+        session_processor = SessionProcessor2(
+            event_data_path=event_data,
             cache_dir='data/cache',
-            min_interactions=5,
+            session_timeout_hours=30,
+            min_interactions=8,  # Match training script
             max_sessions_per_user=20,
             max_samples_per_user=10
         )
         
-        # Load data
-        print("Loading package and session data...")
-        self.package_processor.load_data()
-        self.session_processor.load_data()
+        # Load and process data (will use cache if available)
+        print("Loading and processing data (using cache if available)...")
+        package_processor.load_data()
+        session_processor.load_data()
         
-        print("Creating mappings...")
-        self.package_processor.create_mappings()
-        self.session_processor.create_mappings()
+        package_processor.create_mappings()
+        session_processor.create_mappings()
         
-        print("Extracting sessions...")
-        self.session_processor.extract_sessions()
+        session_processor.extract_sessions()
         
-        # Prepare samples
+        # Check if we can reuse processed samples from model training
         print("Preparing training samples...")
-        all_samples = self.session_processor.prepare_enhanced_training_data()
+        all_samples = session_processor.prepare_enhanced_training_data()
         
-        # Apply same processing as training
-        event_to_idx = self.session_processor.get_idx_mappings()['event_to_idx']
+        # Identify event types
+        event_to_idx = session_processor.get_idx_mappings()['event_to_idx']
         all_samples = identify_event_types(all_samples, event_to_idx)
         
-        # Filter by session length
+        # Apply same filters as training
+        print("Applying training filters...")
         quality_samples = filter_by_min_session_length(all_samples, min_session_length=2)
         
-        # Use valid packages from training
+        # Use exact same valid packages from training
         valid_packages = set(self.model_info.get('valid_packages', []))
         if valid_packages:
-            print(f"Filtering to {len(valid_packages)} valid packages from training")
-            filtered_samples = [s for s in quality_samples 
-                              if str(s.get('purchased_package', '')) in valid_packages]
+            print(f"Using {len(valid_packages)} valid packages from training")
+            filtered_samples = []
+            for sample in quality_samples:
+                if str(sample.get('purchased_package', '')) in valid_packages:
+                    filtered_samples.append(sample)
         else:
-            filtered_samples, _ = filter_items_by_frequency(quality_samples, min_frequency=5)
+            print("No valid packages in model_info, filtering by frequency...")
+            filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=5)
         
-        # Time-based split
-        train_ratio = self.model_info.get('train_ratio', 0.91)
-        train_samples, test_samples, split_date = time_based_split_year(
-            filtered_samples, train_ratio=train_ratio
+        # Use exact same split as training
+        print("Creating train/test split...")
+        train_samples, test_samples, split_date = time_based_split_year(filtered_samples, train_ratio=self.train_ratio)
+        
+        # Verify split date matches training
+        expected_split = self.model_info.get('split_date')
+        if expected_split and split_date != expected_split:
+            print(f"Warning: Split date mismatch! Expected: {expected_split}, Got: {split_date}")
+        
+        print(f"\nData split verification:")
+        print(f"  Split date: {split_date} (expected: {expected_split})")
+        print(f"  Train samples: {len(train_samples):,}")
+        print(f"  Test samples: {len(test_samples):,}")
+        
+        # Get only purchase samples from test set
+        test_purchases = [s for s in test_samples if s.get('is_purchase', False)]
+        print(f"  Test purchases: {len(test_purchases):,}")
+        
+        # Identify warm/cold start users
+        train_users = set(sample['user_id'] for sample in train_samples)
+        test_user_purchases = defaultdict(list)
+        for sample in test_purchases:
+            test_user_purchases[sample['user_id']].append(sample)
+        
+        warm_users = {}
+        cold_users = {}
+        
+        for user_id, purchases in test_user_purchases.items():
+            if user_id in train_users:
+                warm_users[user_id] = purchases
+            else:
+                cold_users[user_id] = purchases
+        
+        print(f"\nUser analysis:")
+        print(f"  Warm start users (in train): {len(warm_users):,}")
+        print(f"  Cold start users (new): {len(cold_users):,}")
+        print(f"  Warm start purchases: {sum(len(p) for p in warm_users.values()):,}")
+        print(f"  Cold start purchases: {sum(len(p) for p in cold_users.values()):,}")
+        
+        # Store processors for later use
+        self.package_processor = package_processor
+        self.session_processor = session_processor
+        
+        return train_samples, test_purchases, warm_users, cold_users
+    
+    def get_model_recommendations(self, user_id: str, top_k: int = 100) -> List[Dict]:
+        """Get recommendations from the loaded model"""
+        try:
+            # Get user index
+            user_idx = self.session_processor.user_to_idx.get(user_id)
+            if user_idx is None:
+                return []
+            
+            # Create a dummy batch for this user
+            # We'll use the last session data for this user if available
+            user_samples = [s for s in self.all_test_samples if s['user_id'] == user_id]
+            if not user_samples:
+                return []
+            
+            # Use the most recent sample for this user
+            sample = user_samples[-1]
+            
+            # Create batch
+            from utils.training_utils import create_dataloaders, move_batch_to_device
+            
+            # Create a single-sample dataset for inference
+            dummy_train_samples = [sample]  # Just for dataloader creation
+            test_samples = [sample]
+            
+            _, test_loader = create_dataloaders(
+                train_samples=dummy_train_samples,
+                test_samples=test_samples,
+                package_processor=self.package_processor,
+                session_processor=self.session_processor,
+                batch_size=1,
+                num_workers=0,
+                use_weighted_sampling=False
+            )
+            
+            # Get predictions
+            with torch.no_grad():
+                for batch in test_loader:
+                    batch = move_batch_to_device(batch, self.device)
+                    outputs = self.model(batch)
+                    predictions = outputs['predictions'][0]  # First (and only) sample
+                    
+                    # Get top k predictions
+                    scores, indices = torch.topk(predictions, k=min(top_k, len(predictions)))
+                    
+                    # Convert to package IDs
+                    idx_to_package = {v: k for k, v in self.session_processor.package_to_idx.items()}
+                    recommendations = []
+                    
+                    for score, idx in zip(scores.cpu().numpy(), indices.cpu().numpy()):
+                        package_id = idx_to_package.get(idx)
+                        if package_id:
+                            recommendations.append({
+                                'package_id': package_id,
+                                'score': float(score)
+                            })
+                    
+                    return recommendations
+            
+        except Exception as e:
+            print(f"Error getting recommendations for user {user_id}: {e}")
+            return []
+        
+        return []
+
+    def evaluate_ranking_performance(self, test_purchases: List[Dict], 
+                                   k_values: List[int] = [1, 5, 10, 20, 50]) -> Dict:
+        """Evaluate how well the model ranks unseen purchases using efficient batch processing"""
+        print(f"\nEvaluating ranking performance on {len(test_purchases)} purchases...")
+        
+        # Create ONE dataloader for all test samples - much more efficient!
+        print("Creating test dataloader for batch evaluation...")
+        dummy_train_samples = test_purchases[:10]  # Minimal train set
+        
+        from utils.training_utils import create_dataloaders, move_batch_to_device
+        
+        _, test_loader = create_dataloaders(
+            train_samples=dummy_train_samples,
+            test_samples=test_purchases,
+            package_processor=self.package_processor,
+            session_processor=self.session_processor,
+            batch_size=32,  # Process in reasonable batches
+            num_workers=0,
+            use_weighted_sampling=False
         )
         
-        # Focus on purchases only
-        purchase_samples = [s for s in test_samples if s.get('is_purchase', False)]
-        print(f"Found {len(purchase_samples):,} purchase samples in test set")
+        print(f"Created dataloader with {len(test_loader)} batches")
         
-        # Sample if requested
-        if sample_size and sample_size < len(purchase_samples):
-            # Use different random sampling approach
-            np.random.seed(12345)  # Different seed than main evaluation
-            sampled_indices = np.random.choice(len(purchase_samples), sample_size, replace=False)
-            purchase_samples = [purchase_samples[i] for i in sampled_indices]
-            print(f"Randomly sampled {len(purchase_samples):,} purchases")
-        
-        self.test_samples = purchase_samples
-        print(f"✅ Prepared {len(self.test_samples):,} test samples")
-        
-    def create_batch_manually(self, samples: List[Dict], batch_size: int = 32) -> List[Dict]:
-        """Create batches manually without using DataLoader"""
-        print(f"Creating batches manually (batch_size={batch_size})...")
-        
-        batches = []
-        for i in range(0, len(samples), batch_size):
-            batch_samples = samples[i:i+batch_size]
-            batch = self._samples_to_batch(batch_samples)
-            batches.append(batch)
-        
-        print(f"Created {len(batches)} batches")
-        return batches
-    
-    def _samples_to_batch(self, samples: List[Dict]) -> Dict:
-        """Convert samples to batch format manually"""
-        batch_size = len(samples)
-        max_short_term = 10
-        max_long_term = 20
-        
-        # Initialize batch tensors
-        batch = {
-            'user_id': torch.zeros(batch_size, dtype=torch.long),
-            'short_term': {
-                'package_ids': torch.zeros(batch_size, max_short_term, dtype=torch.long),
-                'title_embeddings': torch.zeros(batch_size, max_short_term, 1536),
-                'coordinates': torch.zeros(batch_size, max_short_term, 2),
-                'country_ids': torch.zeros(batch_size, max_short_term, dtype=torch.long),
-                'category_ids': torch.zeros(batch_size, max_short_term, dtype=torch.long),
-                'theme_ids': torch.zeros(batch_size, max_short_term, dtype=torch.long),
-                'prices': torch.zeros(batch_size, max_short_term),
-                'event_types': torch.zeros(batch_size, max_short_term, dtype=torch.long),
-            },
-            'long_term': {
-                'package_ids': torch.zeros(batch_size, max_long_term, dtype=torch.long),
-                'title_embeddings': torch.zeros(batch_size, max_long_term, 1536),
-                'coordinates': torch.zeros(batch_size, max_long_term, 2),
-                'country_ids': torch.zeros(batch_size, max_long_term, dtype=torch.long),
-                'category_ids': torch.zeros(batch_size, max_long_term, dtype=torch.long),
-                'theme_ids': torch.zeros(batch_size, max_long_term, dtype=torch.long),
-                'prices': torch.zeros(batch_size, max_long_term),
-                'event_types': torch.zeros(batch_size, max_long_term, dtype=torch.long),
-            },
-            'purchased': {
-                'package_ids': torch.zeros(batch_size, dtype=torch.long),
-                'title_embeddings': torch.zeros(batch_size, 1536),
-                'coordinates': torch.zeros(batch_size, 2),
-                'country_ids': torch.zeros(batch_size, dtype=torch.long),
-                'category_ids': torch.zeros(batch_size, dtype=torch.long),
-                'theme_ids': torch.zeros(batch_size, dtype=torch.long),
-                'prices': torch.zeros(batch_size),
-            },
-            'is_purchase': torch.ones(batch_size, dtype=torch.bool),  # All are purchases
-        }
-        
-        # Fill batch data
-        user_to_idx = self.session_processor.user_to_idx
-        package_to_idx = self.session_processor.package_to_idx
-        
-        for i, sample in enumerate(samples):
-            # User ID
-            user_id = sample['user_id']
-            batch['user_id'][i] = user_to_idx.get(user_id, 0)
-            
-            # Short-term history
-            short_term_packages = sample.get('short_term_packages', [])[-max_short_term:]
-            short_term_events = sample.get('short_term_events', [])[-max_short_term:]
-            
-            for j, (pkg_id, event_id) in enumerate(zip(short_term_packages, short_term_events)):
-                if j >= max_short_term:
-                    break
-                
-                pkg_idx = package_to_idx.get(str(pkg_id), 0)
-                batch['short_term']['package_ids'][i, j] = pkg_idx
-                batch['short_term']['event_types'][i, j] = event_id
-                
-                # Get package features
-                features = self.package_processor.get_package_features(str(pkg_id))
-                if features:
-                    if features['title_embedding'] is not None:
-                        batch['short_term']['title_embeddings'][i, j] = torch.from_numpy(features['title_embedding'])
-                    if features['latitude'] is not None and features['longitude'] is not None:
-                        batch['short_term']['coordinates'][i, j] = torch.tensor([features['latitude'], features['longitude']])
-                    batch['short_term']['country_ids'][i, j] = features['country_idx']
-                    batch['short_term']['category_ids'][i, j] = features['category_idx']
-                    batch['short_term']['theme_ids'][i, j] = features['theme_idx']
-                    batch['short_term']['prices'][i, j] = features['price']
-            
-            # Long-term history
-            long_term_packages = sample.get('long_term_packages', [])[-max_long_term:]
-            long_term_events = sample.get('long_term_events', [])[-max_long_term:]
-            
-            for j, (pkg_id, event_id) in enumerate(zip(long_term_packages, long_term_events)):
-                if j >= max_long_term:
-                    break
-                
-                pkg_idx = package_to_idx.get(str(pkg_id), 0)
-                batch['long_term']['package_ids'][i, j] = pkg_idx
-                batch['long_term']['event_types'][i, j] = event_id
-                
-                # Get package features
-                features = self.package_processor.get_package_features(str(pkg_id))
-                if features:
-                    if features['title_embedding'] is not None:
-                        batch['long_term']['title_embeddings'][i, j] = torch.from_numpy(features['title_embedding'])
-                    if features['latitude'] is not None and features['longitude'] is not None:
-                        batch['long_term']['coordinates'][i, j] = torch.tensor([features['latitude'], features['longitude']])
-                    batch['long_term']['country_ids'][i, j] = features['country_idx']
-                    batch['long_term']['category_ids'][i, j] = features['category_idx']
-                    batch['long_term']['theme_ids'][i, j] = features['theme_idx']
-                    batch['long_term']['prices'][i, j] = features['price']
-            
-            # Purchased package
-            purchased_id = str(sample['purchased_package'])
-            batch['purchased']['package_ids'][i] = package_to_idx.get(purchased_id, 0)
-            
-            features = self.package_processor.get_package_features(purchased_id)
-            if features:
-                if features['title_embedding'] is not None:
-                    batch['purchased']['title_embeddings'][i] = torch.from_numpy(features['title_embedding'])
-                if features['latitude'] is not None and features['longitude'] is not None:
-                    batch['purchased']['coordinates'][i] = torch.tensor([features['latitude'], features['longitude']])
-                batch['purchased']['country_ids'][i] = features['country_idx']
-                batch['purchased']['category_ids'][i] = features['category_idx']
-                batch['purchased']['theme_ids'][i] = features['theme_idx']
-                batch['purchased']['prices'][i] = features['price']
-        
-        return batch
-    
-    def evaluate_with_detailed_tracking(self, k_values: List[int] = [10, 20, 50]) -> Dict:
-        """Evaluate with detailed sample-by-sample tracking"""
-        print(f"\n🎯 Running detailed evaluation (k={k_values})...")
-        
-        # Create batches
-        batches = self.create_batch_manually(self.test_samples, batch_size=64)
-        
-        # Track results
+        # Batch process all samples
         all_predictions = []
         all_targets = []
-        sample_details = []
         
         self.model.eval()
         with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(batches, desc="Processing batches")):
-                # Move to device
-                batch = self._move_to_device(batch)
+            for batch_idx, batch in enumerate(tqdm(test_loader, desc="Batch evaluation")):
+                batch = move_batch_to_device(batch, self.device)
                 
-                # Forward pass
+                # Get model predictions
                 outputs = self.model(batch)
                 predictions = outputs['predictions']  # [batch_size, num_packages]
                 targets = batch['purchased']['package_ids']  # [batch_size]
                 
-                # Store for later analysis
                 all_predictions.append(predictions.cpu())
                 all_targets.append(targets.cpu())
-                
-                # Track sample details
-                for i in range(targets.size(0)):
-                    sample_idx = batch_idx * 64 + i
-                    if sample_idx < len(self.test_samples):
-                        sample_details.append({
-                            'sample_idx': sample_idx,
-                            'user_id': self.test_samples[sample_idx]['user_id'],
-                            'purchased_package': self.test_samples[sample_idx]['purchased_package'],
-                            'target_idx': targets[i].item(),
-                            'prediction_scores': predictions[i].cpu().numpy()
-                        })
         
-        # Combine all predictions and targets
+        # Combine all results
         all_predictions = torch.cat(all_predictions, dim=0)  # [total_samples, num_packages]
         all_targets = torch.cat(all_targets, dim=0)  # [total_samples]
         
-        print(f"Processed {len(all_predictions)} samples")
+        print(f"Processing {len(all_predictions)} predictions...")
         
-        # Calculate metrics manually
-        metrics = self._calculate_metrics_manually(all_predictions, all_targets, k_values)
+        # Calculate metrics for each sample
+        results = {f'hit@{k}': [] for k in k_values}
+        results['rank'] = []
+        results['mrr'] = []
         
-        # Add detailed analysis
-        metrics['sample_details'] = sample_details[:100]  # Store first 100 for inspection
-        metrics['total_samples'] = len(all_predictions)
+        # Get package ID mapping
+        idx_to_package = {v: k for k, v in self.session_processor.package_to_idx.items()}
         
-        return metrics
-    
-    def _calculate_metrics_manually(self, predictions: torch.Tensor, targets: torch.Tensor, k_values: List[int]) -> Dict:
-        """Calculate metrics manually with transparency"""
-        print("📊 Calculating metrics manually...")
+        for i in tqdm(range(len(all_predictions)), desc="Computing metrics"):
+            predictions = all_predictions[i]  # [num_packages]
+            target_idx = all_targets[i].item()
+            
+            # Get top 100 predictions
+            scores, indices = torch.topk(predictions, k=min(100, len(predictions)))
+            
+            # Convert to package IDs and find target rank
+            rec_package_ids = []
+            for idx in indices:
+                package_id = idx_to_package.get(idx.item())
+                if package_id:
+                    rec_package_ids.append(str(package_id))
+            
+            # Get target package ID
+            target_package = idx_to_package.get(target_idx)
+            if target_package:
+                target_package = str(target_package)
+            
+            # Find rank of target
+            if target_package and target_package in rec_package_ids:
+                rank = rec_package_ids.index(target_package) + 1
+                results['rank'].append(rank)
+                results['mrr'].append(1.0 / rank)
+                
+                # Calculate hits at different k values
+                for k in k_values:
+                    hit = 1.0 if rank <= k else 0.0
+                    results[f'hit@{k}'].append(hit)
+            else:
+                # Not in top 100
+                results['rank'].append(101)  # Beyond top 100
+                results['mrr'].append(0.0)
+                for k in k_values:
+                    results[f'hit@{k}'].append(0.0)
         
+        # Calculate metrics
         metrics = {}
-        total_samples = len(targets)
-        
-        # Get top-k predictions for each sample
         for k in k_values:
-            print(f"Calculating Recall@{k}...")
-            
-            # Get top-k indices for each sample
-            _, top_k_indices = torch.topk(predictions, k, dim=1)  # [total_samples, k]
-            
-            # Check if target is in top-k for each sample
-            targets_expanded = targets.unsqueeze(1).expand(-1, k)  # [total_samples, k]
-            hits = (top_k_indices == targets_expanded).any(dim=1)  # [total_samples]
-            
-            # Calculate recall
-            recall = hits.float().mean().item()
-            metrics[f'purchase_recall@{k}'] = recall
-            
-            print(f"  Recall@{k}: {recall*100:.2f}% ({hits.sum().item()}/{total_samples})")
+            metrics[f'recall@{k}'] = np.mean(results[f'hit@{k}']) * 100
         
-        # Calculate MRR manually
-        print("Calculating MRR...")
-        mrr_sum = 0.0
+        metrics['mrr'] = np.mean(results['mrr'])
+        metrics['mean_rank'] = np.mean(results['rank'])
+        metrics['median_rank'] = np.median(results['rank'])
         
-        for i in range(total_samples):
-            target_idx = targets[i].item()
-            sample_predictions = predictions[i]
-            
-            # Sort predictions in descending order
-            sorted_indices = torch.argsort(sample_predictions, descending=True)
-            
-            # Find rank of target (1-indexed)
-            rank = (sorted_indices == target_idx).nonzero(as_tuple=True)[0]
-            if len(rank) > 0:
-                rank = rank[0].item() + 1  # Convert to 1-indexed
-                mrr_sum += 1.0 / rank
-        
-        mrr = mrr_sum / total_samples
-        metrics['purchase_mrr'] = mrr
-        print(f"  MRR: {mrr:.4f}")
+        # Rank distribution
+        ranks = results['rank']
+        metrics['rank_distribution'] = {
+            'top_1': sum(1 for r in ranks if r == 1) / len(ranks) * 100,
+            'top_5': sum(1 for r in ranks if r <= 5) / len(ranks) * 100,
+            'top_10': sum(1 for r in ranks if r <= 10) / len(ranks) * 100,
+            'top_20': sum(1 for r in ranks if r <= 20) / len(ranks) * 100,
+            'top_50': sum(1 for r in ranks if r <= 50) / len(ranks) * 100,
+            'beyond_100': sum(1 for r in ranks if r > 100) / len(ranks) * 100
+        }
         
         return metrics
     
-    def _move_to_device(self, batch: Dict) -> Dict:
-        """Move batch to device recursively"""
-        if isinstance(batch, torch.Tensor):
-            return batch.to(self.device)
-        elif isinstance(batch, dict):
-            return {key: self._move_to_device(value) for key, value in batch.items()}
-        else:
-            return batch
-    
-    def cross_validate_with_seeds(self, num_seeds: int = 5, sample_size: int = 1000) -> Dict:
-        """Cross-validate results with different random seeds"""
-        print(f"\n🔄 Cross-validating with {num_seeds} different random seeds...")
+    def analyze_warm_cold_performance(self, warm_users: Dict, cold_users: Dict,
+                                    k_values: List[int] = [1, 5, 10, 20, 50]) -> Dict:
+        """Separate analysis for warm and cold start users"""
+        print("\nAnalyzing warm vs cold start performance...")
         
-        results = []
+        # Warm start analysis
+        warm_purchases = []
+        for user_purchases in warm_users.values():
+            warm_purchases.extend(user_purchases)
         
-        for seed in range(num_seeds):
-            print(f"\nSeed {seed + 1}/{num_seeds}: {seed * 111}")
-            
-            # Set seeds
-            np.random.seed(seed * 111)
-            torch.manual_seed(seed * 111)
-            random.seed(seed * 111)
-            
-            # Sample test data with this seed
-            sampled_indices = np.random.choice(len(self.test_samples), min(sample_size, len(self.test_samples)), replace=False)
-            seed_samples = [self.test_samples[i] for i in sampled_indices]
-            
-            # Temporarily replace test samples
-            original_samples = self.test_samples
-            self.test_samples = seed_samples
-            
-            # Evaluate
-            metrics = self.evaluate_with_detailed_tracking([20])
-            results.append(metrics['purchase_recall@20'])
-            
-            print(f"  Seed {seed * 111}: Recall@20 = {metrics['purchase_recall@20']*100:.2f}%")
-            
-            # Restore original samples
-            self.test_samples = original_samples
+        print(f"\nEvaluating {len(warm_purchases)} warm start purchases...")
+        warm_metrics = self.evaluate_ranking_performance(warm_purchases, k_values)
         
-        # Calculate statistics
-        mean_recall = np.mean(results)
-        std_recall = np.std(results)
+        # Cold start analysis
+        cold_purchases = []
+        for user_purchases in cold_users.values():
+            cold_purchases.extend(user_purchases)
+        
+        print(f"\nEvaluating {len(cold_purchases)} cold start purchases...")
+        cold_metrics = self.evaluate_ranking_performance(cold_purchases, k_values)
         
         return {
-            'mean_recall@20': mean_recall,
-            'std_recall@20': std_recall,
-            'individual_results': results,
-            'confidence_interval_95': (mean_recall - 1.96*std_recall, mean_recall + 1.96*std_recall)
+            'warm_start': warm_metrics,
+            'cold_start': cold_metrics
         }
     
-    def run_verification(self, sample_size: Optional[int] = None, cross_validate: bool = True) -> Dict:
-        """Run complete independent verification"""
-        start_time = time.time()
+    def analyze_example_users(self, warm_users: Dict, train_samples: List[Dict], 
+                            num_examples: int = 3) -> List[Dict]:
+        """Detailed analysis of example warm start users"""
+        print(f"\nAnalyzing {num_examples} example warm start users...")
         
-        print("🚀 Starting Independent Model Verification")
-        print("=" * 80)
+        # Select users with multiple test purchases for interesting examples
+        eligible_users = [(user_id, purchases) for user_id, purchases in warm_users.items() 
+                         if len(purchases) >= 2]
         
-        # Load model
-        self.load_model_directly()
+        if len(eligible_users) < num_examples:
+            # Fall back to any warm users
+            eligible_users = list(warm_users.items())
         
+        # Random sample
+        random.seed(42)
+        selected_users = random.sample(eligible_users, min(num_examples, len(eligible_users)))
+        
+        examples = []
+        
+        for user_id, test_purchases in selected_users:
+            print(f"\n--- Analyzing user {user_id} ---")
+            
+            # Get user's training history
+            train_history = [s for s in train_samples if s['user_id'] == user_id]
+            
+            # Extract purchased packages from training
+            train_packages = set()
+            for sample in train_history:
+                if sample.get('is_purchase', False):
+                    train_packages.add(str(sample['purchased_package']))
+            
+            # Get package names
+            package_idx_to_id = {v: k for k, v in self.session_processor.package_to_idx.items()}
+            package_names = {}
+            if hasattr(self.package_processor, 'feed_df'):
+                for pkg_id in list(train_packages) + [str(p['purchased_package']) for p in test_purchases]:
+                    if pkg_id in self.package_processor.feed_df.index:
+                        package_names[pkg_id] = self.package_processor.feed_df.loc[pkg_id, 'title']
+            
+            user_analysis = {
+                'user_id': user_id,
+                'train_purchases': len(train_packages),
+                'train_interactions': len(train_history),
+                'test_purchases': len(test_purchases),
+                'train_packages': list(train_packages)[:5],  # First 5 for brevity
+                'recommendations_analysis': []
+            }
+            
+            # Analyze each test purchase
+            for i, test_purchase in enumerate(test_purchases[:3]):  # Max 3 purchases per user
+                target_package = str(test_purchase['purchased_package'])
+                target_name = package_names.get(target_package, f"Package {target_package}")
+                
+                # For user examples, we'll get recommendations more efficiently
+                # by just using the model directly on this sample
+                try:
+                    from utils.training_utils import create_dataloaders, move_batch_to_device
+                    idx_to_package = {v: k for k, v in self.session_processor.package_to_idx.items()}
+                    
+                    # Create a mini batch for this one sample
+                    single_sample = [test_purchase]
+                    _, mini_loader = create_dataloaders(
+                        train_samples=single_sample,
+                        test_samples=single_sample,
+                        package_processor=self.package_processor,
+                        session_processor=self.session_processor,
+                        batch_size=1,
+                        num_workers=0,
+                        use_weighted_sampling=False
+                    )
+                    
+                    # Get predictions
+                    recommendations = []
+                    with torch.no_grad():
+                        for batch in mini_loader:
+                            batch = move_batch_to_device(batch, self.device)
+                            outputs = self.model(batch)
+                            predictions = outputs['predictions'][0]  # First sample
+                            
+                            # Get top 20
+                            scores, indices = torch.topk(predictions, k=20)
+                            
+                            # Convert to recommendations
+                            for score, idx in zip(scores.cpu().numpy(), indices.cpu().numpy()):
+                                package_id = idx_to_package.get(idx)
+                                if package_id:
+                                    recommendations.append({
+                                        'package_id': package_id,
+                                        'score': float(score)
+                                    })
+                            break
+                except Exception as e:
+                    print(f"Error getting recommendations for user {user_id}: {e}")
+                    recommendations = []
+                
+                # Find rank
+                rec_ids = [str(rec['package_id']) for rec in recommendations]
+                if target_package in rec_ids:
+                    rank = rec_ids.index(target_package) + 1
+                else:
+                    rank = ">20"
+                
+                # Get top 5 recommendations with names
+                top_5_recs = []
+                for j, rec in enumerate(recommendations[:5]):
+                    pkg_id = str(rec['package_id'])
+                    pkg_name = package_names.get(pkg_id, f"Package {pkg_id}")
+                    top_5_recs.append({
+                        'rank': j + 1,
+                        'package_id': pkg_id,
+                        'name': pkg_name,
+                        'score': float(rec['score'])
+                    })
+                
+                purchase_analysis = {
+                    'target_package': target_package,
+                    'target_name': target_name,
+                    'rank': rank,
+                    'purchase_date': test_purchase.get('session_start', 'Unknown'),
+                    'top_5_recommendations': top_5_recs
+                }
+                
+                user_analysis['recommendations_analysis'].append(purchase_analysis)
+            
+            examples.append(user_analysis)
+            
+            # Print summary
+            print(f"  Training: {len(train_packages)} purchases, {len(train_history)} interactions")
+            print(f"  Test: {len(test_purchases)} purchases")
+            for i, analysis in enumerate(user_analysis['recommendations_analysis']):
+                print(f"  Purchase {i+1}: '{analysis['target_name']}' - Rank: {analysis['rank']}")
+        
+        return examples
+    
+    def run_verification(self) -> Dict:
+        """Run complete verification pipeline"""
         # Prepare data
-        self.prepare_data_independently(sample_size)
+        train_samples, test_purchases, warm_users, cold_users = self.prepare_test_data()
         
-        # Main evaluation
-        main_results = self.evaluate_with_detailed_tracking([10, 20, 50])
+        # Overall performance
+        print("\n" + "="*80)
+        print("OVERALL PERFORMANCE ON TEST PURCHASES")
+        print("="*80)
+        overall_metrics = self.evaluate_ranking_performance(test_purchases)
         
-        # Cross-validation if requested
-        if cross_validate and len(self.test_samples) > 1000:
-            cv_results = self.cross_validate_with_seeds(num_seeds=5, sample_size=1000)
-            main_results['cross_validation'] = cv_results
+        # Warm vs Cold analysis
+        print("\n" + "="*80)
+        print("WARM VS COLD START ANALYSIS")
+        print("="*80)
+        warm_cold_metrics = self.analyze_warm_cold_performance(warm_users, cold_users)
         
-        # Summary
-        verification_results = {
-            'verification_time': time.time() - start_time,
+        # Example users
+        print("\n" + "="*80)
+        print("DETAILED USER EXAMPLES")
+        print("="*80)
+        examples = self.analyze_example_users(warm_users, train_samples)
+        
+        # Compile results
+        results = {
             'model_info_path': self.model_info_path,
-            'total_test_samples': len(self.test_samples),
-            'device': str(self.device),
-            'main_results': main_results,
-            'verification_date': time.strftime('%Y-%m-%d %H:%M:%S')
+            'model_type': self.model_info.get('model_type', 'unknown'),
+            'overall_performance': overall_metrics,
+            'warm_cold_comparison': warm_cold_metrics,
+            'user_examples': examples,
+            'test_statistics': {
+                'total_test_purchases': len(test_purchases),
+                'warm_start_users': len(warm_users),
+                'cold_start_users': len(cold_users),
+                'warm_start_purchases': sum(len(p) for p in warm_users.values()),
+                'cold_start_purchases': sum(len(p) for p in cold_users.values())
+            }
         }
         
-        self._print_verification_summary(verification_results)
+        # Print final summary
+        self._print_summary(results)
         
-        return verification_results
+        # Save results
+        output_file = 'verification_results.json'
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"\nDetailed results saved to: {output_file}")
+        
+        return results
     
-    def _print_verification_summary(self, results: Dict):
-        """Print verification summary"""
-        main = results['main_results']
+    def _print_summary(self, results: Dict):
+        """Print results summary"""
+        print("\n" + "="*80)
+        print("VERIFICATION SUMMARY")
+        print("="*80)
         
-        print("\n" + "=" * 80)
-        print("🎯 INDEPENDENT VERIFICATION RESULTS")
-        print("=" * 80)
+        overall = results['overall_performance']
+        print("\nOverall Performance:")
+        print(f"  Recall@1: {overall['recall@1']:.1f}%")
+        print(f"  Recall@5: {overall['recall@5']:.1f}%")
+        print(f"  Recall@10: {overall['recall@10']:.1f}%")
+        print(f"  Recall@20: {overall['recall@20']:.1f}%")
+        print(f"  MRR: {overall['mrr']:.4f}")
+        print(f"  Mean Rank: {overall['mean_rank']:.1f}")
+        print(f"  Median Rank: {overall['median_rank']:.0f}")
         
-        print(f"Model: {os.path.basename(results['model_info_path'])}")
-        print(f"Test samples: {results['total_test_samples']:,}")
-        print(f"Device: {results['device']}")
-        print(f"Verification time: {results['verification_time']:.1f}s")
+        print("\nRank Distribution:")
+        dist = overall['rank_distribution']
+        print(f"  Top 1: {dist['top_1']:.1f}%")
+        print(f"  Top 5: {dist['top_5']:.1f}%")
+        print(f"  Top 10: {dist['top_10']:.1f}%")
+        print(f"  Top 20: {dist['top_20']:.1f}%")
+        print(f"  Beyond 100: {dist['beyond_100']:.1f}%")
         
-        print(f"\n📊 Core Metrics:")
-        for k in [10, 20, 50]:
-            if f'purchase_recall@{k}' in main:
-                recall = main[f'purchase_recall@{k}']
-                print(f"  Purchase Recall@{k}: {recall*100:.2f}%")
+        warm_cold = results['warm_cold_comparison']
+        print("\nWarm vs Cold Start:")
+        print(f"  Warm Recall@20: {warm_cold['warm_start']['recall@20']:.1f}%")
+        print(f"  Cold Recall@20: {warm_cold['cold_start']['recall@20']:.1f}%")
+        print(f"  Warm MRR: {warm_cold['warm_start']['mrr']:.4f}")
+        print(f"  Cold MRR: {warm_cold['cold_start']['mrr']:.4f}")
         
-        if 'purchase_mrr' in main:
-            print(f"  Purchase MRR: {main['purchase_mrr']:.4f}")
-        
-        # Cross-validation results
-        if 'cross_validation' in main:
-            cv = main['cross_validation']
-            print(f"\n🔄 Cross-Validation (5 seeds, 1000 samples each):")
-            print(f"  Mean Recall@20: {cv['mean_recall@20']*100:.2f}% ± {cv['std_recall@20']*100:.2f}%")
-            print(f"  95% CI: [{cv['confidence_interval_95'][0]*100:.2f}%, {cv['confidence_interval_95'][1]*100:.2f}%]")
-            print(f"  Individual results: {[f'{r*100:.1f}%' for r in cv['individual_results']]}")
-        
-        # Compare with original evaluation
-        expected_recall_20 = 46.18
-        actual_recall_20 = main.get('purchase_recall@20', 0) * 100
-        difference = actual_recall_20 - expected_recall_20
-        
-        print(f"\n✅ Verification vs Original:")
-        print(f"  Original Recall@20: {expected_recall_20:.2f}%")
-        print(f"  Verified Recall@20: {actual_recall_20:.2f}%")
-        print(f"  Difference: {difference:+.2f}%")
-        
-        if abs(difference) < 2.0:
-            print(f"  Status: ✅ VERIFIED (within 2%)")
-        elif abs(difference) < 5.0:
-            print(f"  Status: ⚠️  CLOSE (within 5%)")
-        else:
-            print(f"  Status: ❌ SIGNIFICANT DIFFERENCE (>5%)")
+        stats = results['test_statistics']
+        print("\nTest Data Statistics:")
+        print(f"  Total purchases: {stats['total_test_purchases']:,}")
+        print(f"  Warm users: {stats['warm_start_users']:,} ({stats['warm_start_purchases']:,} purchases)")
+        print(f"  Cold users: {stats['cold_start_users']:,} ({stats['cold_start_purchases']:,} purchases)")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Independent verification of model performance'
-    )
-    parser.add_argument('--model-info', type=str, required=True,
-                        help='Path to model_info.json file')
-    parser.add_argument('--sample-size', type=int,
-                        help='Limit to N samples for faster verification')
-    parser.add_argument('--no-cross-validate', action='store_true',
-                        help='Skip cross-validation')
-    parser.add_argument('--save-results', type=str,
-                        help='Save detailed results to JSON file')
+    parser = argparse.ArgumentParser(description='Verify NATR model performance on unseen test data')
+    parser.add_argument('--model-info', type=str, 
+                       default='output/model_info/model_info_enhanced_pretrain_finetune.json',
+                       help='Path to model_info.json file')
     
     args = parser.parse_args()
     
+    # Validate file exists
     if not os.path.exists(args.model_info):
         print(f"Error: Model info file not found: {args.model_info}")
         return 1
     
     try:
         # Run verification
-        verifier = IndependentModelVerifier(args.model_info)
-        results = verifier.run_verification(
-            sample_size=args.sample_size,
-            cross_validate=not args.no_cross_validate
-        )
-        
-        # Save results if requested
-        if args.save_results:
-            with open(args.save_results, 'w') as f:
-                json.dump(results, f, indent=2, default=str)
-            print(f"\nDetailed results saved to: {args.save_results}")
+        verifier = ModelPerformanceVerifier(args.model_info)
+        results = verifier.run_verification()
         
         return 0
         

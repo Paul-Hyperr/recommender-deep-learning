@@ -616,7 +616,10 @@ def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Opt
                 targets = batch['purchased']['package_ids']
                 
                 # Handle different loss function signatures
-                if 'is_purchase' in batch:
+                # Check if loss function is a custom one that handles multiple arguments
+                loss_fn_name = loss_fn.__class__.__name__
+                
+                if loss_fn_name in ['IntentSoftLabelLoss', 'NaturalPurchaseLoss', 'FocalLoss'] and 'is_purchase' in batch:
                     is_purchase = batch['is_purchase']
                     
                     # Check for checkout and add_to_cart flags
@@ -630,7 +633,7 @@ def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Opt
                     else:
                         loss = loss_fn(predictions, targets, is_purchase)
                 else:
-                    # Fallback for simpler loss functions
+                    # Standard loss functions (CrossEntropyLoss, etc.)
                     loss = loss_fn(predictions, targets)
                 
                 loss = loss / accumulation_steps  # Scale for accumulation
@@ -646,7 +649,10 @@ def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Opt
             targets = batch['purchased']['package_ids']
             
             # Handle different loss function signatures
-            if 'is_purchase' in batch:
+            # Check if loss function is a custom one that handles multiple arguments
+            loss_fn_name = loss_fn.__class__.__name__
+            
+            if loss_fn_name in ['IntentSoftLabelLoss', 'NaturalPurchaseLoss', 'FocalLoss'] and 'is_purchase' in batch:
                 is_purchase = batch['is_purchase']
                 
                 # Check for checkout and add_to_cart flags
@@ -660,7 +666,7 @@ def train_epoch(model: nn.Module, train_loader: DataLoader, optimizer: optim.Opt
                 else:
                     loss = loss_fn(predictions, targets, is_purchase)
             else:
-                # Fallback for simpler loss functions
+                # Standard loss functions (CrossEntropyLoss, etc.)
                 loss = loss_fn(predictions, targets)
             
             loss = loss / accumulation_steps  # Scale for accumulation

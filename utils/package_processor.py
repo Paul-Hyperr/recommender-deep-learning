@@ -207,7 +207,11 @@ class PackageProcessor:
     
     def _generate_embeddings(self):
         """Generate embeddings for all package titles using LLMPackageEncoder"""
-        if not self.load_embeddings or not self.llm_encoder:
+        if not self.load_embeddings:
+            print("Skipping embedding generation: load_embeddings is False")
+            return
+        if not self.llm_encoder:
+            print("Skipping embedding generation: llm_encoder is None")
             return
         
         print("Generating title embeddings using LLMPackageEncoder...")
@@ -243,6 +247,12 @@ class PackageProcessor:
         
         print(f"Generating embeddings for {len(packages_to_encode)} packages...")
         
+        # Check if LLM encoder client is available
+        if not self.llm_encoder.client:
+            print("Warning: No OpenAI client available. All embeddings will be zero.")
+        else:
+            print("OpenAI client is available for embedding generation.")
+        
         # Process packages in batches
         batch_size = 200
         for i in range(0, len(packages_to_encode), batch_size):
@@ -252,19 +262,33 @@ class PackageProcessor:
             batch_titles = [pkg['title'] for pkg in batch_packages]
             batch_main_ids = [pkg['main_id'] for pkg in batch_packages]
             
+            print(f"Processing batch {i//batch_size + 1}: {len(batch_packages)} packages")
+            
             # Get embeddings using enhanced LLM encoder (with fallback support)
-            embeddings_tensor = self.llm_encoder.process_batch_titles(
-                titles=batch_titles,
-                main_ids=batch_main_ids,
-                package_metadata=batch_packages  # Pass full metadata for fallback generation
-            )
-            
-            # Convert to numpy and store
-            for j, main_id_str in enumerate(batch_main_ids):
-                embedding_np = embeddings_tensor[j].detach().numpy()
-                self.package_embeddings[main_id_str] = embedding_np
-            
-            print(f"Processed batch {i//batch_size + 1}/{(len(packages_to_encode) + batch_size - 1)//batch_size}")
+            try:
+                embeddings_tensor = self.llm_encoder.process_batch_titles(
+                    titles=batch_titles,
+                    main_ids=batch_main_ids,
+                    package_metadata=batch_packages  # Pass full metadata for fallback generation
+                )
+                
+                # Convert to numpy and store
+                successful_embeddings = 0
+                for j, main_id_str in enumerate(batch_main_ids):
+                    embedding_np = embeddings_tensor[j].detach().numpy()
+                    self.package_embeddings[main_id_str] = embedding_np
+                    
+                    # Check if this is a zero embedding
+                    if not np.allclose(embedding_np, 0, atol=1e-8):
+                        successful_embeddings += 1
+                
+                print(f"  → Generated {successful_embeddings}/{len(batch_packages)} non-zero embeddings")
+                
+            except Exception as e:
+                print(f"  → Error processing batch: {e}")
+                # Generate zero embeddings as fallback
+                for main_id_str in batch_main_ids:
+                    self.package_embeddings[main_id_str] = np.zeros(self.llm_encoder.embedding_dim)
         
         # Save LLM encoder cache
         self.llm_encoder._save_embedding_cache()
@@ -274,15 +298,44 @@ class PackageProcessor:
         
         print(f"Generated embeddings for {len(packages_to_encode)} packages")
         
-        # Report any packages still without embeddings
-        missing_embeddings = []
-        for main_id, metadata in self.package_metadata.items():
-            main_id_str = str(main_id)
-            if main_id_str not in self.package_embeddings:
-                missing_embeddings.append(main_id_str)
+        # Check for and retry zero embeddings
+        zero_embeddings = [mid for mid, emb in self.package_embeddings.items() 
+                          if np.allclose(emb, 0, atol=1e-8)]
         
-        if missing_embeddings:
-            print(f"Warning: {len(missing_embeddings)} packages still without embeddings: {missing_embeddings[:5]}...")
+        if zero_embeddings:
+            print(f"Found {len(zero_embeddings)} zero embeddings. Retrying...")
+            
+            # Clear from cache and regenerate with enhanced fallback titles
+            for mid in zero_embeddings:
+                self.llm_encoder.embedding_cache.pop(mid, None)
+                metadata = self.package_metadata[mid]
+                title = metadata.get('title', '').strip()
+                
+                if not title:
+                    # Enhanced fallback title
+                    parts = [v for k, v in metadata.items() 
+                            if k in ['theme', 'category'] and v and v != 'Unknown']
+                    location = next((f"in {v}" for k, v in metadata.items() 
+                                   if k in ['city', 'country'] and v and v != 'Unknown'), '')
+                    if location: parts.append(location)
+                    title = " - ".join(parts) or f"Travel Package {mid}"
+                
+                # Regenerate single embedding
+                embedding = self.llm_encoder.get_embedding(title, cache_key=mid)
+                if embedding is not None and not np.allclose(embedding, 0, atol=1e-8):
+                    self.package_embeddings[mid] = embedding
+            
+            self.llm_encoder._save_embedding_cache()
+            remaining_zero = sum(1 for mid in zero_embeddings 
+                               if np.allclose(self.package_embeddings.get(mid, [0]), 0, atol=1e-8))
+            print(f"Retry complete. {remaining_zero} packages still have zero embeddings.")
+        
+        # Report final status
+        missing = [str(mid) for mid, _ in self.package_metadata.items() 
+                  if str(mid) not in self.package_embeddings]
+        
+        if missing:
+            print(f"Warning: {len(missing)} packages without embeddings: {missing[:5]}...")
         else:
             print("All packages now have embeddings!")
     
@@ -1245,13 +1298,17 @@ class TravelPackageDataset(Dataset):
                 st_times = sample.get('short_term_timestamps', [0] * len(st_pkg_ids))[-self.max_short_term:]
                 
                 for j, (pkg_id, event_id, timestamp) in enumerate(zip(st_pkg_ids, st_event_ids, st_times)):
-                    pkg_idx = self.package_to_idx.get(str(pkg_id), 0)
+                    pkg_idx = self.package_to_idx.get(pkg_id, 0)  # Keep original type
                     st_packages[i, j] = pkg_idx
                     st_events[i, j] = event_id
-                    st_timestamps[i, j] = timestamp
+                    # Convert timestamp to numeric value if it's a pandas Timestamp
+                    if hasattr(timestamp, 'timestamp'):
+                        st_timestamps[i, j] = timestamp.timestamp()
+                    else:
+                        st_timestamps[i, j] = float(timestamp) if timestamp else 0.0
                     
                     # Get features efficiently
-                    features = self._get_package_features_fast(str(pkg_id))
+                    features = self._get_package_features_fast(str(pkg_id))  # Features need string for lookup
                     st_countries[i, j] = features[0]
                     st_categories[i, j] = features[1]
                     st_themes[i, j] = features[2]
@@ -1265,12 +1322,16 @@ class TravelPackageDataset(Dataset):
                 lt_times = sample.get('long_term_timestamps', [0] * len(lt_pkg_ids))[-self.max_long_term:]
                 
                 for j, (pkg_id, event_id, timestamp) in enumerate(zip(lt_pkg_ids, lt_event_ids, lt_times)):
-                    pkg_idx = self.package_to_idx.get(str(pkg_id), 0)
+                    pkg_idx = self.package_to_idx.get(pkg_id, 0)  # Keep original type
                     lt_packages[i, j] = pkg_idx
                     lt_events[i, j] = event_id
-                    lt_timestamps[i, j] = timestamp
+                    # Convert timestamp to numeric value if it's a pandas Timestamp
+                    if hasattr(timestamp, 'timestamp'):
+                        lt_timestamps[i, j] = timestamp.timestamp()
+                    else:
+                        lt_timestamps[i, j] = float(timestamp) if timestamp else 0.0
                     
-                    features = self._get_package_features_fast(str(pkg_id))
+                    features = self._get_package_features_fast(str(pkg_id))  # Features need string for lookup
                     lt_countries[i, j] = features[0]
                     lt_categories[i, j] = features[1]
                     lt_themes[i, j] = features[2]
@@ -1278,7 +1339,7 @@ class TravelPackageDataset(Dataset):
                     lt_prices[i, j] = min(features[3], max_price_value)
             
             # Process purchased
-            purchased_id = str(sample['purchased_package'])
+            purchased_id = sample['purchased_package']  # Keep original type (int64)
             purchased_packages[i] = self.package_to_idx.get(purchased_id, 0)
             
             # Get purchase timestamp if available
