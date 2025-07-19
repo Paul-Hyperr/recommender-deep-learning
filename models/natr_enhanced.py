@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pandas as pd
 from typing import Dict, Optional, Tuple
 
 class ViewLevelAttention(nn.Module):
@@ -29,14 +30,14 @@ class ViewLevelAttention(nn.Module):
             nn.Linear(64, 1)
         )
         
-        # Simplified view-wise scaling factors 
+        # Enhanced view-wise scaling factors for 6 views
         # Initialize with different weights to encourage learning diverse patterns
-        # [title, coordinates, country, category/theme, price, time]
-        initial_weights = torch.tensor([1.2, 1.0, 0.8, 0.8, 1.0, 0.6])
+        # [title, coordinates, country, category/theme, price, events]
+        initial_weights = torch.tensor([1.2, 1.0, 0.8, 0.8, 1.0, 1.1])
         self.view_scalars = nn.Parameter(initial_weights)  # Different initial weights for views
         
-        # Detect number of views at runtime
-        self.num_expected_views = 6  # Updated for 6 views with price
+        # Detect number of views at runtime - updated for 6 views
+        self.num_expected_views = 6  # 6 views with events as separate view (no time view)
         
         # Final fusion with residual connection and layer norm
         # Linear size adapts to the actual number of views used
@@ -153,7 +154,7 @@ class ViewLevelAttention(nn.Module):
 
 
 class PackageEncoder(nn.Module):
-    """Package encoder with event awareness, temporal information, and enhanced price handling"""
+    """Enhanced package encoder with events as separate view and temporal information"""
     def __init__(self, config):
         super().__init__()
         
@@ -183,9 +184,10 @@ class PackageEncoder(nn.Module):
             nn.Linear(64, 1)
         )
         
-        # NEW: Enhanced price encoder for better price-based recommendations
+        # Enhanced price encoder with personalized user bias
+        self.user_price_bias = nn.Embedding(config.num_users, 32, padding_idx=0)
         self.price_encoder = nn.Sequential(
-            nn.Linear(1, 64),
+            nn.Linear(1 + 32, 64),  # price + user price bias
             nn.ReLU(),
             nn.Dropout(config.dropout * 0.5),  # Lower dropout for numerical features
             nn.Linear(64, 128),
@@ -215,21 +217,23 @@ class PackageEncoder(nn.Module):
             nn.Linear(config.hidden_dim, config.hidden_dim)
         )
         
-        # Enhanced event type embedding with more dimensions and attention
-        # Keep original size for compatibility with existing cached data
-        self.event_embedding = nn.Embedding(5, 32, padding_idx=0)  # 5 event types
+        # ENHANCED: Separate event processing as its own view
+        # Event type embedding with more dimensions for richer representation
+        self.event_embedding = nn.Embedding(5, 64, padding_idx=0)  # Increased from 32 to 64
         
-        # Event encoder with attention to capture sequential importance
-        self.event_encoder = nn.Sequential(
-            nn.Linear(32, 64),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(64, config.hidden_dim)
+        # Enhanced event sequence encoder with LSTM for temporal patterns
+        self.event_lstm = nn.LSTM(
+            input_size=64,
+            hidden_size=config.hidden_dim // 2,
+            batch_first=True,
+            bidirectional=True,
+            num_layers=1,
+            dropout=config.dropout if config.dropout > 0 else 0
         )
         
-        # Add personalized event attention layer - learns to focus on important event types based on user
+        # Event attention layer to focus on important event patterns
         self.event_attention = nn.Sequential(
-            nn.Linear(32 + config.user_embedding_dim, 64),  # Include user embedding
+            nn.Linear(config.hidden_dim + config.user_embedding_dim, 64),
             nn.Tanh(),
             nn.Dropout(config.dropout),
             nn.Linear(64, 32),
@@ -237,21 +241,16 @@ class PackageEncoder(nn.Module):
             nn.Linear(32, 1)
         )
         
-        # Final event projection
-        self.event_projection = nn.Linear(32, config.hidden_dim)
+        # Final event projection to hidden_dim
+        self.event_projection = nn.Linear(config.hidden_dim, config.hidden_dim)
         
-        # Time features encoder - ensure it outputs exactly hidden_dim
-        self.time_encoder = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.ReLU(),
-            nn.Linear(64, config.hidden_dim)
-        )
-        
-        # View-level attention - updated to include price view and personalized attention
+        # View-level attention - updated for 6 views including separate events (no time view)
         self.view_attention = ViewLevelAttention(config.hidden_dim, config.user_embedding_dim)
     
-    def forward(self, batch_data: Dict[str, torch.Tensor], user_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Forward pass with event awareness, temporal information, and personalized attention
+    # Removed set_global_temporal_params as time view is no longer used
+    
+    def forward(self, batch_data: Dict[str, torch.Tensor], user_embedding: Optional[torch.Tensor] = None, user_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass with events as separate view and temporal information
         
         Args:
             batch_data: Dictionary containing package features
@@ -272,35 +271,48 @@ class PackageEncoder(nn.Module):
             geo_score = torch.sigmoid(self.geo_attention(coord_base))  # 0-1 score of geographic relevance
             coord_repr = (coord_base * (1.0 + geo_score)).unsqueeze(1)  # Boost with geo score
             
-            # NEW: Process price data - check for both standard and normalized prices
+            # Process price data with personalized user bias
             if 'normalized_prices' in batch_data:
                 # Use pre-normalized prices if available
                 price_data = batch_data['normalized_prices'].float().unsqueeze(-1)
-                price_repr = self.price_encoder(price_data).unsqueeze(1)
             elif 'prices' in batch_data:
                 # Normalize prices on-the-fly
                 price_data = batch_data['prices'].float().unsqueeze(-1).clamp(min=0.01)
                 # Apply logarithmic scaling to compress price range
-                log_price = torch.log(price_data + 1.0)
-                price_repr = self.price_encoder(log_price).unsqueeze(1)
+                price_data = torch.log(price_data + 1.0)
             else:
-                # No price data available
-                price_repr = torch.zeros(batch_size, 1, self.price_encoder[-2].out_features, 
-                                      device=batch_data['title_embeddings'].device)
+                # No price data available - use zeros
+                price_data = torch.zeros(batch_size, 1, device=batch_data['title_embeddings'].device)
+            
+            # Get user price bias if user_ids available
+            if user_ids is not None:
+                user_price_bias = self.user_price_bias(user_ids).unsqueeze(1)  # [batch_size, 1, 32]
+                # Combine price with user bias
+                price_data_expanded = price_data.unsqueeze(1)  # [batch_size, 1, 1]
+                price_with_bias = torch.cat([price_data_expanded, user_price_bias], dim=-1)  # [batch_size, 1, 33]
+                price_repr = self.price_encoder(price_with_bias)
+            else:
+                # Fallback without user bias - pad with zeros
+                price_padding = torch.zeros(batch_size, 1, 32, device=batch_data['title_embeddings'].device)
+                price_data_expanded = price_data.unsqueeze(1)  # [batch_size, 1, 1]
+                price_with_padding = torch.cat([price_data_expanded, price_padding], dim=-1)
+                price_repr = self.price_encoder(price_with_padding)
             
             country_emb = self.country_embedding(batch_data['country_ids']).unsqueeze(1)
             category_emb = self.category_embedding(batch_data['category_ids']).unsqueeze(1)
             theme_emb = self.theme_embedding(batch_data['theme_ids']).unsqueeze(1)
             
-            # Event embeddings if available
+            # ENHANCED: Process events as separate view
             if 'event_types' in batch_data:
                 event_emb = self.event_embedding(batch_data['event_types']).unsqueeze(1)
+                # For single package, just encode directly
+                event_encoded, _ = self.event_lstm(event_emb)
+                event_repr = self.event_projection(event_encoded)
             else:
-                event_emb = torch.zeros(batch_size, 1, 32, device=batch_data['title_embeddings'].device)
+                event_repr = torch.zeros(batch_size, 1, self.event_projection.out_features, 
+                                       device=batch_data['title_embeddings'].device)
             
-            # Time information (for single item case, we don't have temporal information)
-            time_repr = torch.zeros(batch_size, 1, self.time_encoder[0].out_features, 
-                                   device=batch_data['title_embeddings'].device)
+            # Time information removed - handled in package attention instead
             
         else:
             # Sequence case
@@ -318,64 +330,65 @@ class PackageEncoder(nn.Module):
             geo_score = torch.sigmoid(self.geo_attention(coord_base))  # Batch x Seq x 1
             coord_repr = coord_base * (1.0 + geo_score)  # Boost with geographic relevance score
             
-            # NEW: Process price data for sequences
+            # Process price data for sequences with personalized user bias
             if 'normalized_prices' in batch_data:
                 # Use pre-normalized prices if available
                 price_data = batch_data['normalized_prices'].float().unsqueeze(-1)
-                price_flat = price_data.view(-1, 1)
-                price_repr = self.price_encoder(price_flat).view(batch_size, seq_len, -1)
             elif 'prices' in batch_data:
                 # Normalize prices on-the-fly
                 price_data = batch_data['prices'].float().unsqueeze(-1).clamp(min=0.01)
-                price_flat = price_data.view(-1, 1)
                 # Apply logarithmic scaling to compress price range
-                log_price = torch.log(price_flat + 1.0)
-                price_repr = self.price_encoder(log_price).view(batch_size, seq_len, -1)
+                price_data = torch.log(price_data + 1.0)
             else:
-                # No price data available
-                price_repr = torch.zeros(batch_size, seq_len, self.price_encoder[-2].out_features, 
-                                      device=batch_data['title_embeddings'].device)
+                # No price data available - use zeros
+                price_data = torch.zeros(batch_size, seq_len, 1, device=batch_data['title_embeddings'].device)
+            
+            # Get user price bias if user_ids available
+            if user_ids is not None:
+                user_price_bias = self.user_price_bias(user_ids).unsqueeze(1).expand(-1, seq_len, -1)  # [batch_size, seq_len, 32]
+                # Combine price with user bias
+                price_with_bias = torch.cat([price_data, user_price_bias], dim=-1)
+                price_flat = price_with_bias.view(-1, 1 + 32)
+                price_repr = self.price_encoder(price_flat).view(batch_size, seq_len, -1)
+            else:
+                # Fallback without user bias - pad with zeros
+                price_padding = torch.zeros(batch_size, seq_len, 32, device=batch_data['title_embeddings'].device)
+                price_with_padding = torch.cat([price_data, price_padding], dim=-1)
+                price_flat = price_with_padding.view(-1, 1 + 32)
+                price_repr = self.price_encoder(price_flat).view(batch_size, seq_len, -1)
             
             country_emb = self.country_embedding(batch_data['country_ids'])
             category_emb = self.category_embedding(batch_data['category_ids'])
             theme_emb = self.theme_embedding(batch_data['theme_ids'])
             
-            # Event embeddings
+            # ENHANCED: Process events as separate sequential view
             if 'event_types' in batch_data:
                 event_emb = self.event_embedding(batch_data['event_types'])
+                
+                # Process event sequences with LSTM to capture temporal patterns
+                event_encoded, _ = self.event_lstm(event_emb)
+                
+                # Apply personalized attention to focus on important event patterns
+                if user_embedding is not None:
+                    # Expand user embedding to match sequence length
+                    user_emb_for_event = user_embedding.unsqueeze(1).expand(-1, seq_len, -1)
+                    
+                    # Concatenate event representation with user embedding
+                    event_with_user = torch.cat([event_encoded, user_emb_for_event], dim=-1)
+                    event_attn_scores = self.event_attention(event_with_user)  # [batch_size, seq_len, 1]
+                    event_attn_weights = F.softmax(event_attn_scores, dim=1)
+                    event_weighted = event_encoded * event_attn_weights
+                else:
+                    # Fallback to non-personalized processing
+                    event_weighted = event_encoded
+                
+                # Final projection to hidden_dim
+                event_repr = self.event_projection(event_weighted)
             else:
-                event_emb = torch.zeros(batch_size, seq_len, 32, device=batch_data['title_embeddings'].device)
-            
-            # Process temporal information if available
-            if 'timestamps' in batch_data:
-                # Ensure timestamps are floating point and valid
-                timestamps = batch_data['timestamps'].float().clamp(min=1.0)  # Avoid invalid timestamps
-                
-                # Calculate time deltas from most recent event (within each sequence)
-                # For each batch item, find its most recent timestamp
-                # Create a mask for valid timestamps (non-zero values)
-                timestamp_mask = (timestamps > 1.0).float()
-                masked_timestamps = timestamps * timestamp_mask
-                
-                # Use masked max to find the most recent event in each sequence
-                # Add a small value to ensure we don't have division by zero
-                max_times, _ = masked_timestamps.max(dim=1, keepdim=True)
-                
-                # Calculate recency: how recent is each event compared to the most recent one
-                # We add 1 before dividing to keep values in reasonable range
-                time_deltas = torch.clamp(max_times - timestamps, min=0.0) + 1.0
-                
-                # Apply log scaling to compress the range of time differences
-                # This converts absolute time differences to a more meaningful relative scale
-                log_time_deltas = torch.log(time_deltas).unsqueeze(-1)  # [batch_size, seq_len, 1]
-                
-                # Process through time encoder to get representation with correct hidden_dim
-                time_repr = self.time_encoder(log_time_deltas)
-                
-            else:
-                # No temporal information available
-                time_repr = torch.zeros(batch_size, seq_len, self.time_encoder[0].out_features, 
+                event_repr = torch.zeros(batch_size, seq_len, self.event_projection.out_features, 
                                        device=batch_data['title_embeddings'].device)
+            
+            # Time information removed - handled in package attention instead
         
         # Process country embeddings separately
         country_repr = self.country_encoder(country_emb.view(-1, country_emb.size(-1))).view(batch_size, seq_len, -1)
@@ -384,53 +397,16 @@ class PackageEncoder(nn.Module):
         cat_combined = torch.cat([category_emb, theme_emb], dim=-1)
         cat_repr = self.category_encoder(cat_combined.view(-1, cat_combined.size(-1))).view(batch_size, seq_len, -1)
         
-        # Process events with personalized attention mechanism to weight different event types 
-        # based on user preferences
-        try:
-            # Apply personalized attention mechanism
-            if user_embedding is not None:
-                # Expand user embedding to match sequence length
-                if seq_len > 1:
-                    user_emb_for_event = user_embedding.unsqueeze(1).expand(-1, seq_len, -1)
-                else:
-                    user_emb_for_event = user_embedding.unsqueeze(1)
-                
-                # Concatenate event embedding with user embedding
-                event_with_user = torch.cat([event_emb, user_emb_for_event], dim=-1)
-                event_attn_scores = self.event_attention(event_with_user)  # [batch_size, seq_len, 1]
-            else:
-                # Fallback to non-personalized attention
-                padding = torch.zeros(*event_emb.shape[:-1], self.event_attention[0].in_features - 32, 
-                                    device=event_emb.device)
-                event_with_padding = torch.cat([event_emb, padding], dim=-1)
-                event_attn_scores = self.event_attention(event_with_padding)
-            
-            event_attn_weights = F.softmax(event_attn_scores, dim=1)
-            event_weighted = event_emb * event_attn_weights  # Apply attention weights
-        except Exception as e:
-            # Fallback if dimensions don't match
-            print(f"Warning: Event attention failed with error: {e}")
-            event_weighted = event_emb  # Skip attention for incompatible dimensions
-        
-        # Enhanced event representation with dedicated encoder
-        event_encoded = self.event_encoder(event_weighted)
-        
-        # Combine event information - now with stronger event type semantics
-        # Early fusion with title representation
-        title_repr = title_repr + 0.3 * event_encoded  # Increased from 0.1 to 0.3 to strengthen event signal
-        
-        # Apply view-level attention with all representations
-        # Equal moderate weights (1.2) are given to title, coordinates, country, and price features
-        # Lower weights are given to category (0.8) and temporal features (0.6)
+        # Apply view-level attention with 6 views including separate events
         # The order of views must match the order of view_scalars in ViewLevelAttention:
-        # [title, coord_primary, country, category/theme, price, time]
+        # [title, coordinates, country, category/theme, price, events]
         views = [
             title_repr,            # Content-based similarity (view index 0 - weight 1.2)
-            coord_repr,            # Geographic proximity (view index 1 - weight 1.2)
-            country_repr,          # Country representation (view index 2 - weight 1.2)
+            coord_repr,            # Geographic proximity (view index 1 - weight 1.0)
+            country_repr,          # Country representation (view index 2 - weight 0.8)
             cat_repr,              # Category/theme preferences (view index 3 - weight 0.8)
-            price_repr,            # Price-based recommendations (view index 4 - weight 1.2)
-            time_repr              # Temporal information (view index 5 - weight 0.6)
+            price_repr,            # Price-based recommendations (view index 4 - weight 1.0)
+            event_repr             # Event sequential patterns (view index 5 - weight 1.1)
         ]
         unified_repr = self.view_attention(views, user_embedding)
         
@@ -511,23 +487,20 @@ class PackageLevelAttention(nn.Module):
             # Ensure timestamps are floating point and valid
             timestamps = timestamps.float().clamp(min=1.0)  # Avoid invalid timestamps
             
-            # Create a mask for valid timestamps (non-zero values)
-            timestamp_mask = (timestamps > 1.0).float()
-            masked_timestamps = timestamps * timestamp_mask
+            # Calculate time deltas from the most recent item (assumed to be at the end)
+            # Get the maximum timestamp in each sequence (most recent)
+            max_time = torch.max(timestamps, dim=1, keepdim=True)[0]
             
-            # Use masked max to find the most recent event in each sequence
-            max_times, _ = masked_timestamps.max(dim=1, keepdim=True)
+            # Calculate delta_t = max_time - timestamp for each item
+            # This gives us how far back in time each item is from the most recent
+            delta_t = max_time - timestamps + 1.0  # Add 1 to avoid log(0)
             
-            # Calculate recency: how recent is each event compared to the most recent one
-            # We add 1 before dividing to keep values in reasonable range
-            time_deltas = torch.clamp(max_times - timestamps, min=0.0) + 1.0
+            # Apply -log(delta_t) for recency bias
+            # Items closer in time (smaller delta_t) will have larger (less negative) values
+            log_delta_t = -torch.log(delta_t).unsqueeze(-1)  # [batch_size, seq_len, 1]
             
-            # Apply log scaling to compress the range of time differences
-            log_time_deltas = torch.log(time_deltas).unsqueeze(-1)  # [batch_size, seq_len, 1]
-            
-            # Get recency bias - more recent = higher score (smaller time_delta)
-            # Negative sign converts time_delta to recency (higher = more recent)
-            recency_bias = self.time_bias(-log_time_deltas).squeeze(-1)  # [batch_size, seq_len]
+            # Process through time bias network to get attention bias
+            recency_bias = self.time_bias(log_delta_t).squeeze(-1)  # [batch_size, seq_len]
             
             # Add recency bias to attention scores - expand for multi-head
             recency_bias = recency_bias.unsqueeze(1).unsqueeze(1)  # [batch_size, 1, 1, seq_len]
@@ -798,11 +771,11 @@ class GatedFusion(nn.Module):
         adjusted_gate = initial_balance * gate + (1 - initial_balance) * (1 - gate)
         
         # Apply gated fusion with the adjusted gate
-        fused = adjusted_gate * long_term_proj + (1 - adjusted_gate) * short_term_proj
+        temporal_fused = adjusted_gate * long_term_proj + (1 - adjusted_gate) * short_term_proj
         
-        # Add moderate residual connection with the user embedding
-        # Balanced at 0.3 to allow personalization without overwhelming item preferences
-        fused = fused + 0.3 * user_proj
+        # Proper weighted combination: 80% temporal fusion, 20% user identity
+        # This ensures weights sum to 1.0 for better normalization
+        fused = 0.8 * temporal_fused + 0.2 * user_proj
         
         # Final projection and normalization
         fused = self.output_projection(fused)
@@ -811,10 +784,10 @@ class GatedFusion(nn.Module):
         return fused
 
 
-class NATR(nn.Module):
+class NATREnhanced(nn.Module):
     """
-    Enhanced NATR model with natural event learning capability, temporal awareness,
-    and analysis capabilities for attention patterns
+    Enhanced NATR model with events as separate view (6 views total), natural event learning capability,
+    temporal awareness through package attention, and analysis capabilities for attention patterns
     """
     def __init__(self, config):
         super().__init__()
@@ -849,19 +822,26 @@ class NATR(nn.Module):
         # Learnable popularity bias for each package
         self.popularity_bias = nn.Parameter(torch.zeros(config.num_packages))
         
-        # Optional: Learnable popularity embeddings for richer representation
-        # Disable by default to avoid popularity dominating personalization
-        self.use_popularity_embedding = getattr(config, 'use_popularity_embedding', False)
-        if self.use_popularity_embedding:
-            self.popularity_embedding = nn.Embedding(config.num_packages, 32)
-            # Project popularity embedding to combine with predictions
-            self.popularity_projection = nn.Linear(32, 1)
-            # Learnable weight for popularity contribution - start very small
-            self.popularity_weight = nn.Parameter(torch.tensor(0.01))
+        # Recent popularity boost - uses only last month of training data
+        self.recent_popularity_weight = getattr(config, 'recent_popularity_weight', 0.2)
+        self.recent_popularity_scores = None  # Will be set during training
+        
+        # Removed learnable popularity embeddings to avoid redundancy with recent popularity
+        # Recent popularity boost provides sufficient popularity signal
         
         # Debug mode for capturing attention weights
         self.debug_mode = False
         self.attention_weights = {}
+    
+    def set_global_temporal_params(self, dataset_start_time: float, dataset_end_time: float):
+        """
+        Set global temporal parameters for all encoders
+        
+        Args:
+            dataset_start_time: Unix timestamp of earliest event in dataset
+            dataset_end_time: Unix timestamp of latest event in dataset
+        """
+        self.package_encoder.set_global_temporal_params(dataset_start_time, dataset_end_time)
     
     def initialize_popularity(self, item_frequencies):
         """Initialize popularity bias and embeddings based on item frequencies
@@ -884,16 +864,18 @@ class NATR(nn.Module):
             # Scale down significantly to avoid overwhelming the learned representations
             self.popularity_bias.data = log_popularity * 0.001  # Very small scaling to not dominate
             
-            # Initialize popularity embeddings if used
-            if self.use_popularity_embedding:
-                # Use frequency rank as additional signal
-                _, sorted_indices = torch.sort(item_frequencies, descending=True)
-                rank = torch.zeros(len(sorted_indices), dtype=torch.float32, device=sorted_indices.device)
-                rank[sorted_indices] = torch.arange(len(sorted_indices), dtype=torch.float32, device=sorted_indices.device)
-                
-                # Initialize first dimension with log frequency, second with rank
-                self.popularity_embedding.weight.data[:, 0] = log_popularity
-                self.popularity_embedding.weight.data[:, 1] = -rank / len(rank)  # Negative so higher rank = higher value
+            # Learnable popularity embeddings removed - using recent popularity instead
+    
+    def set_recent_popularity(self, recent_scores):
+        """Set recent popularity scores from last month of training data
+        
+        Args:
+            recent_scores: Tensor of shape [num_packages] with recent popularity scores
+        """
+        if recent_scores is not None:
+            # Convert to same device as model
+            device = next(self.parameters()).device
+            self.recent_popularity_scores = recent_scores.to(device)
     
     def enable_debug(self, enable=True):
         """Enable debug mode to capture attention weights"""
@@ -904,7 +886,7 @@ class NATR(nn.Module):
                 module.save_attention = enable
     
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Forward pass with temporal information and attention tracking"""
+        """Forward pass with events as separate view, temporal information and attention tracking"""
         
         # Extract user IDs
         user_ids = batch['user_id']
@@ -935,8 +917,8 @@ class NATR(nn.Module):
             user_emb = torch.randn_like(user_emb) * 0.01
         
         # Encode packages with event information and personalized attention
-        short_term_repr = self.package_encoder(batch['short_term'], user_emb)
-        long_term_repr = self.package_encoder(batch['long_term'], user_emb)
+        short_term_repr = self.package_encoder(batch['short_term'], user_emb, user_ids)
+        long_term_repr = self.package_encoder(batch['long_term'], user_emb, user_ids)
         
         # Create masks
         short_term_mask = (batch['short_term']['package_ids'] > 0).float()
@@ -977,12 +959,6 @@ class NATR(nn.Module):
         personalization_weight = torch.where(has_history.unsqueeze(1), 0.3, 0.1)  # 0.3 for users with history, 0.1 for cold start
         predictions = predictions + personalization_weight * user_bias
         
-        # Re-enable popularity bias with adaptive scale
-        # Stronger for cold start users, weaker for users with history
-        # COMMENTED OUT: Testing without popularity features
-        # popularity_scale = torch.where(has_history.unsqueeze(1), 0.005, 0.01)  # Smaller scale for users with history
-        # predictions = predictions + (self.popularity_bias.unsqueeze(0) * popularity_scale)
-        
         # Enhanced debug: Monitor user learning more frequently and thoroughly
         if self.training and self.monitor_user_learning and torch.rand(1).item() < 0.001:  # Back to less frequent monitoring
             pred_std = predictions.std(dim=0).mean().item()
@@ -998,7 +974,7 @@ class NATR(nn.Module):
             user_emb_std = user_emb.std(dim=0).mean().item()
             user_emb_range = user_emb.max().item() - user_emb.min().item()
             
-            print(f"🔍 User Learning Monitor:")
+            print(f"🔍 User Learning Monitor (Enhanced NATR with 6 views):")
             print(f"  Prediction std: {pred_std:.4f}")
             print(f"  User embedding std: {user_emb_std:.4f}, range: {user_emb_range:.4f}")
             print(f"  Raw user bias std: {raw_bias_std:.4f}, range: {raw_bias_range:.4f}")
@@ -1015,22 +991,12 @@ class NATR(nn.Module):
                     elif pred_diff > 0.1:
                         print("  ✅ Users have diverse predictions!")
         
-        # Add popularity embedding contribution if enabled
-        if self.use_popularity_embedding:
-            # Get all package indices (0 to num_packages-1)
-            package_indices = torch.arange(self.config.num_packages, device=predictions.device)
-            
-            # Get popularity embeddings for all packages
-            pop_embeddings = self.popularity_embedding(package_indices)  # [num_packages, 32]
-            
-            # Project to scalar values
-            pop_scores = self.popularity_projection(pop_embeddings).squeeze(-1)  # [num_packages]
-            
-            # Add weighted popularity scores to predictions
-            predictions = predictions + self.popularity_weight * pop_scores.unsqueeze(0)
+        # Add recent popularity boost - only uses last month of training data
+        if self.recent_popularity_scores is not None and self.recent_popularity_weight > 0:
+            predictions = predictions + self.recent_popularity_weight * self.recent_popularity_scores.unsqueeze(0)
         
         # Encode purchased package with personalized attention
-        purchased_repr = self.package_encoder(batch['purchased'], user_emb)
+        purchased_repr = self.package_encoder(batch['purchased'], user_emb, user_ids)
         
         # Collect attention weights in debug mode
         if self.debug_mode:

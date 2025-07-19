@@ -41,6 +41,10 @@ class LLMPackageEncoder(nn.Module):
         # Initialize OpenAI client
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if self.api_key:
+            # Initialize OpenAI client with minimal logging
+            import logging
+            logging.getLogger("httpx").setLevel(logging.ERROR)
+            logging.getLogger("openai").setLevel(logging.ERROR)
             self.client = OpenAI(api_key=self.api_key)
         else:
             print("Warning: No OpenAI API key provided. LLM embeddings will not be available.")
@@ -253,7 +257,6 @@ class LLMPackageEncoder(nn.Module):
             Tensor of embeddings (not projected)
         """
         embeddings = []
-        batch_size = 20
         
         for idx, (title, main_id) in enumerate(zip(titles, main_ids)):
             main_id_str = str(main_id)

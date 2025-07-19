@@ -1,24 +1,13 @@
 """
-Complete NATR training script with natural event learning
-Optimized for computation time while ensuring functionality
-Combines the best features from train_natr.py and train_natr_optimized.py
+Baseline NATR training script using SessionProcessor2 and NATREnhanced
+Clean implementation for comparing against advanced training strategies
 """
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-import pandas as pd
 import os
 import sys
-import time
-import json
-import glob
 
-from datetime import datetime
 from tqdm import tqdm
-from collections import defaultdict, Counter
-from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 import logging
 
@@ -31,28 +20,27 @@ if hasattr(torch, 'set_float32_matmul_precision'):
     torch.set_float32_matmul_precision('high')
 
 # Import all necessary components
-from models.natr import NATR, NATRConfig
-from utils.session_processor import SessionProcessor
-from utils.package_processor import PackageProcessor, TravelPackageDataset
-from utils.unified_metrics import UnifiedMetricsTracker, MetricsTracker, EnhancedEventMetrics
+import time
+import json
+from models.natr_enhanced import NATREnhanced, NATRConfig
+from utils.session_processor2 import SessionProcessor2
+from utils.package_processor import PackageProcessor
+from utils.unified_metrics import UnifiedMetricsTracker
 from utils.loss_functions import NaturalPurchaseLoss
 from utils.memory_utils import (
     detect_device, create_memory_config, MemoryOptimizer, AMPManager, 
-    GradientAccumulator, get_optimal_batch_size, print_memory_stats,
-    create_optimizer_with_memory_optimizations, get_model_size
+    GradientAccumulator, get_optimal_batch_size, get_model_size
 )
 from utils.training_utils import (
     filter_by_min_session_length, 
     filter_items_by_frequency, 
     time_based_split_year,
     analyze_data_distribution,
-    move_batch_to_device,
-    train_epoch,
-    evaluate,
-    create_dataloaders,
-    set_performance_mode,
-    limit_samples_for_testing
+    create_dataloaders
 )
+
+# Import identify_event_types from training_utils to avoid circular import
+from utils.training_utils import identify_event_types
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -60,25 +48,17 @@ logger = logging.getLogger('train_natr')
 
 
 def evaluate_with_unified_metrics(model, test_loader, device, memory_optimizer, k_values=[5, 10, 20]):
-    """
-    Enhanced evaluation function using UnifiedMetricsTracker with memory optimization
-    Combines detailed event-specific metrics from train_natr.py with memory optimization from train_natr_optimized.py
-    """
+    """Simple evaluation function using UnifiedMetricsTracker"""
     model.eval()
     
-    # Initialize unified metrics tracker for comprehensive metrics
+    # Initialize unified metrics tracker
     metrics_tracker = UnifiedMetricsTracker(k_values=k_values)
-    
-    # Track sample counts for reporting
-    total_samples = 0
     
     with torch.no_grad():
         # Clear memory before evaluation
         memory_optimizer.before_epoch(0)
         
-        progress_bar = tqdm(test_loader, desc="Evaluating",
-                           mininterval=10.0,  # Update at most every 10 seconds
-                           miniters=100)      # Update after at least 100 iterations
+        progress_bar = tqdm(test_loader, desc="Evaluating")
         
         for batch_idx, batch in enumerate(progress_bar):
             # Prepare batch and memory optimization
@@ -98,65 +78,37 @@ def evaluate_with_unified_metrics(model, test_loader, device, memory_optimizer, 
             if targets.dtype != torch.long:
                 targets = targets.long()
             
-            # Get event type indicators with fallback to zeros
-            # Note: The batch dict directly contains these flags at the top level
+            # Get event type indicators
             is_purchase = batch.get('is_purchase', torch.zeros_like(targets, dtype=torch.bool))
             has_checkout = batch.get('has_checkout', torch.zeros_like(targets, dtype=torch.bool))
             has_add_to_cart = batch.get('has_add_to_cart', torch.zeros_like(targets, dtype=torch.bool))
             
-            # Debug: Print first batch info (reduced output)
-            if batch_idx == 0:
-                # Check if predictions are different for different users
-                if len(predictions) > 10:
-                    top_k_items = torch.topk(predictions[:10], k=20, dim=1).indices
-                    # Check uniqueness
-                    unique_predictions = len(set(tuple(row.tolist()) for row in top_k_items))
-                    print(f"Debug - Unique prediction patterns: {unique_predictions}/10, Item coverage improving: ✓")
-            
-            # Get inclusive flags for individual event recalls
-            has_checkout_inclusive = batch.get('has_checkout_inclusive', has_checkout)  # Default to hierarchical if not present
-            has_add_to_cart_inclusive = batch.get('has_add_to_cart_inclusive', has_add_to_cart)  # Default to hierarchical if not present
-            
-            # Update unified metrics tracker with all event types
-            # For individual recalls, we need inclusive flags (samples that had these events)
-            # For weighted recall, we need hierarchical flags (only highest priority event)
+            # Update metrics tracker
             metrics_tracker.update(
                 predictions=predictions,
                 targets=targets,
                 is_purchase=is_purchase,
-                has_checkout=has_checkout,  # Hierarchical for weighted recall
-                has_add_to_cart=has_add_to_cart,  # Hierarchical for weighted recall
-                has_checkout_inclusive=has_checkout_inclusive,  # Inclusive for individual recalls
-                has_add_to_cart_inclusive=has_add_to_cart_inclusive  # Inclusive for individual recalls
+                has_checkout=has_checkout,
+                has_add_to_cart=has_add_to_cart
             )
-            
-            total_samples += targets.size(0)
             
             # Memory optimization after batch
             memory_optimizer.after_batch(batch_idx)
             
-            # Update progress bar with memory info if available
-            if memory_optimizer.track_memory and batch_idx % 50 == 0:
-                memory_stats = f"Mem: {memory_optimizer.peak_memory / (1024*1024):.0f}MB" if memory_optimizer.peak_memory > 0 else ""
-                if memory_stats:
-                    progress_bar.set_postfix_str(memory_stats)
     
     # Clean up memory after evaluation
     memory_optimizer.after_epoch(0)
     
-    # Compute comprehensive metrics
+    # Compute metrics
     metrics = metrics_tracker.compute()
-    
-    print(f"Evaluation completed on {total_samples:,} samples")
     
     return metrics
 
 
-def train_epoch_with_memory_optimization(model, train_loader, optimizer, loss_fn, device, epoch,
-                                       memory_optimizer, amp_manager, gradient_accumulator):
+def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch,
+                memory_optimizer, amp_manager, gradient_accumulator):
     """
-    Enhanced training function combining memory optimization with detailed loss tracking
-    Uses standardized memory management from train_natr_optimized.py
+    Simple training function for one epoch
     """
     model.train()
     total_loss = 0
@@ -165,10 +117,8 @@ def train_epoch_with_memory_optimization(model, train_loader, optimizer, loss_fn
     # Prepare for epoch
     memory_optimizer.before_epoch(epoch)
     
-    # Create progress bar with better formatting
-    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}", 
-                      mininterval=5.0,   # Update at most every 5 seconds
-                      miniters=50)       # Update after at least 50 iterations
+    # Create progress bar
+    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
     
     optimizer.zero_grad()
     
@@ -184,34 +134,20 @@ def train_epoch_with_memory_optimization(model, train_loader, optimizer, loss_fn
             outputs = model(batch)
             predictions = outputs['predictions']
             
-            # Get targets and event indicators
-            # The 'purchased' dict contains the package features
-            # The actual target indices are in the 'package_ids' field
+            # Get targets
             targets = batch['purchased']['package_ids']
             
-            # Ensure targets are long tensors for loss calculation
+            # Ensure targets are long tensors
             if targets.dtype != torch.long:
                 targets = targets.long()
+                
+            # Get event flags
             is_purchase = batch.get('is_purchase', torch.zeros_like(targets, dtype=torch.bool))
             has_checkout = batch.get('has_checkout', torch.zeros_like(targets, dtype=torch.bool))
             has_add_to_cart = batch.get('has_add_to_cart', torch.zeros_like(targets, dtype=torch.bool))
             
-            # Calculate loss with event-specific handling
-            # Check if loss function supports event-specific handling
-            try:
-                # Try with all event flags first
-                loss = loss_fn(predictions, targets, is_purchase, has_checkout, has_add_to_cart)
-            except TypeError:
-                try:
-                    # Try with checkout flag only
-                    loss = loss_fn(predictions, targets, is_purchase, has_checkout)
-                except TypeError:
-                    try:
-                        # Try with purchase flag only
-                        loss = loss_fn(predictions, targets, is_purchase)
-                    except TypeError:
-                        # Fallback to basic loss
-                        loss = loss_fn(predictions, targets)
+            # Calculate loss
+            loss = loss_fn(predictions, targets, is_purchase, has_checkout, has_add_to_cart)
         
         # Backward pass with gradient accumulation and AMP scaling
         original_loss = gradient_accumulator.backward(loss)
@@ -220,47 +156,22 @@ def train_epoch_with_memory_optimization(model, train_loader, optimizer, loss_fn
         total_loss += original_loss.item()
         num_batches += 1
         
-        # Monitor gradients every 100 batches for user learning analysis
-        if batch_idx % 100 == 0 and batch_idx > 0:
-            user_grads = []
-            other_grads = []
-            
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    grad_norm = param.grad.norm().item()
-                    if 'user_encoder.user_embedding' in name or 'user_transform' in name:
-                        user_grads.append(grad_norm)
-                    else:
-                        other_grads.append(grad_norm)
-            
-            if user_grads and other_grads:
-                avg_user_grad = sum(user_grads) / len(user_grads)
-                avg_other_grad = sum(other_grads) / len(other_grads)
-                
-                # Print gradient monitoring occasionally
-                if batch_idx % 300 == 0:
-                    ratio = avg_user_grad / avg_other_grad if avg_other_grad > 0 else 0
-                    print(f"🔍 Gradient Monitor - User: {avg_user_grad:.6f}, Other: {avg_other_grad:.6f}, Ratio: {ratio:.3f}")
-        
         # Apply gradient clipping before optimizer step
         if gradient_accumulator.should_step():
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         # Step optimizer if accumulation is complete
-        if gradient_accumulator.step(optimizer):
-            # Optimizer step was performed, reset gradients already handled in step()
-            pass
+        gradient_accumulator.step(optimizer)
         
         # Memory optimization after batch
         memory_optimizer.after_batch(batch_idx)
         
-        # Update progress bar with comprehensive info
+        # Update progress bar
         postfix = {
             'loss': total_loss / num_batches,
             'lr': optimizer.param_groups[0]['lr']
         }
         
-        # Add memory info if tracking is enabled
         if memory_optimizer.track_memory and memory_optimizer.peak_memory > 0:
             postfix['mem_mb'] = f"{memory_optimizer.peak_memory / (1024*1024):.0f}"
             
@@ -276,16 +187,16 @@ def train_epoch_with_memory_optimization(model, train_loader, optimizer, loss_fn
     return total_loss / num_batches
 
 
-def main(performance_mode="balanced", dataset="13months", event_data_path=None):
-    """Main training function with enhanced memory management and metrics
-    
-    Args:
-        performance_mode (str): One of 'fastest', 'balanced', 'accurate'
-        dataset (str): Dataset to use - '13months' or '2months'
-        event_data_path (str): Optional explicit path to event data file
-    """
+def main(performance_mode="balanced", dataset="13months", event_data_path=None, oversample_purchases=1):
+    """Simple baseline NATR training with SessionProcessor2 and NATREnhanced"""
     # Detect device and create memory configuration
     device, device_type = detect_device()
+    
+    # Initialize metrics history for convergence visualization
+    metrics_history = []
+    use_oversampling = oversample_purchases > 1
+    model_name = "natr_oversampled" if use_oversampling else "natr_baseline"
+    print(f"📊 Tracking metrics for: {model_name}")
     memory_config = create_memory_config(device_type, performance_mode)
     
     # Create memory optimizer
@@ -295,15 +206,13 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
     logger.info(f"Using device: {device} ({device_type})")
     logger.info(f"Performance mode: {performance_mode}")
     
-    # Clear old caches to ensure fresh embeddings
-    package_features_cache = "data/cache/package_features.pkl"
-    if os.path.exists(package_features_cache):
-        logger.info(f"Removing package features cache to use latest embeddings")
-        os.remove(package_features_cache)
+    # Clear old caches if needed
+    if os.path.exists("data/cache/package_features.pkl"):
+        os.remove("data/cache/package_features.pkl")
         
     # Clear dataset caches
+    import glob
     for cache_file in glob.glob("data/cache/dataset_*.pkl"):
-        logger.info(f"Removing dataset cache: {cache_file}")
         os.remove(cache_file)
     
     # Data paths
@@ -313,7 +222,7 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
     if event_data_path is None:
         # Map dataset selection to file path
         dataset_map = {
-            '13months': 'data/bookit_events_data_13_months.parquet',
+            '13months': 'data/13_months_new2_clean.parquet',
             '2months': 'data/bookit_events_2_months.parquet'
         }
         
@@ -339,11 +248,11 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
         base_batch_size = min(base_batch_size * 2, 512)  # Larger batches for speed
     elif performance_mode == "accurate":
         num_epochs = 100
-        learning_rate = 0.0005
+        learning_rate = 5e-5  # Match enhanced script learning rates
         base_batch_size = max(base_batch_size // 2, 32)  # Smaller batches for accuracy
     else:  # "balanced"
         num_epochs = 50
-        learning_rate = 0.001
+        learning_rate = 1e-4  # Match enhanced script pre-training learning rate
     
     # Initialize processors
     print("\nInitializing data processors...")
@@ -357,10 +266,11 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
         use_reduced_embeddings=True if device_type != 'cpu' else False
     )
     
-    session_processor = SessionProcessor(
-        event_data_path=event_data_path,  # Updated parameter name
+    session_processor = SessionProcessor2(
+        event_data_path=event_data_path,
         cache_dir='data/cache',
-        min_interactions=5,
+        session_timeout_hours=30,
+        min_interactions=8,
         max_sessions_per_user=20,
         max_samples_per_user=10
     )
@@ -375,6 +285,8 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
     print(f"  Gradient accumulation steps: {memory_config.gradient_accumulation_steps}")
     print(f"  Number of epochs: {num_epochs}")
     print(f"  Memory optimization: {memory_config.enable_memory_tracking}")
+    if oversample_purchases > 1:
+        print(f"  Purchase oversampling: {oversample_purchases}x")
     
     # Load and process data
     print("\n1. Loading package data...")
@@ -393,15 +305,21 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
     print("\n5. Preparing training samples...")
     samples = session_processor.prepare_enhanced_training_data()
     
-    # Identify event types in samples (checkout, add-to-cart)
-    from utils.training_utils import identify_event_types
+    # Identify event types in samples
     samples = identify_event_types(samples, session_processor.event_to_idx)
+    
+    print("\n5b. Creating intent-based samples for consistency with other scripts...")
+    # Use the same intent-based sampling as the working scripts for fair comparison
+    from train_natr_enhanced_pre_finetune_fixed import create_intent_samples_enhanced
+    samples = create_intent_samples_enhanced(samples, session_processor.event_to_idx)
     
     print("\n6. Applying data filters...")
     
     # Apply quality filters
-    quality_samples = filter_by_min_session_length(samples, min_session_length=2)  # Reduced from 3
-    filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=5)  # Reduced from 10
+    quality_samples = filter_by_min_session_length(samples, min_session_length=3)
+    # Filter out single_view samples for better performance
+    quality_samples = [s for s in quality_samples if s.get('intent_level', 'multi_view') != 'single_view']
+    filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=5)
     
     # Validate purchase events
     purchase_count = sum(1 for s in filtered_samples if s.get('is_purchase', False))
@@ -412,6 +330,34 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
     
     # Time-based split
     train_samples, test_samples, split_date = time_based_split_year(filtered_samples, train_ratio=0.91)
+    
+    # Apply purchase oversampling if requested
+    if oversample_purchases > 1:
+        print(f"\n📈 Applying {oversample_purchases}x oversampling to purchase samples...")
+        original_train_size = len(train_samples)
+        
+        # Separate purchase and non-purchase samples
+        train_purchase_samples = [s for s in train_samples if s.get('is_purchase', False)]
+        train_non_purchase_samples = [s for s in train_samples if not s.get('is_purchase', False)]
+        
+        print(f"  Original: {len(train_purchase_samples)} purchases, {len(train_non_purchase_samples)} non-purchases")
+        
+        # Oversample purchases
+        oversampled_purchases = []
+        for _ in range(oversample_purchases):
+            oversampled_purchases.extend(train_purchase_samples)
+        
+        # Combine oversampled purchases with non-purchases
+        train_samples = oversampled_purchases + train_non_purchase_samples
+        
+        # Shuffle to mix purchases throughout the dataset
+        import random
+        random.seed(42)
+        random.shuffle(train_samples)
+        
+        print(f"  After oversampling: {len(oversampled_purchases)} purchases, {len(train_non_purchase_samples)} non-purchases")
+        print(f"  Total train samples: {original_train_size} → {len(train_samples)}")
+        print(f"  Purchase ratio: {len(train_purchase_samples)/original_train_size*100:.1f}% → {len(oversampled_purchases)/len(train_samples)*100:.1f}%")
     
     # Ensure test set has enough purchase samples
     purchase_samples = [s for s in test_samples if s.get('is_purchase', False)]
@@ -448,7 +394,7 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
     train_loader, test_loader = create_dataloaders(
         train_samples, test_samples, package_processor, session_processor,
         batch_size=base_batch_size, num_workers=0 if device_type == 'mps' else 2,
-        use_weighted_sampling=True
+        use_weighted_sampling=False  # Disable weighted sampling for speed
     )
     
     print(f"\nDataset sizes:")
@@ -471,11 +417,10 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
     actual_embedding_dim = package_tensors['title_embeddings'].shape[1]
     print(f"Detected title embedding dimension: {actual_embedding_dim}")
     
-    # Simplified model dimensions for consistent training
-    # Use moderate size to balance capacity and training stability
+    # Align with enhanced pre-training configuration for fair comparison
     hidden_dim = 256
-    embedding_dim = 256
-    dropout = 0.2  # Fixed dropout for stability
+    embedding_dim = 128  # Match enhanced script embedding dimension
+    dropout = 0.35  # Match enhanced script dropout for consistency
     
     # Create model configuration with correct parameter names
     config = NATRConfig(
@@ -490,8 +435,9 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
         dropout=dropout
     )
     
-    # Create model
-    model = NATR(config)
+    # Create Enhanced NATR model with 6 views
+    print("Creating Enhanced NATR model with 6 views (including events as separate view)...")
+    model = NATREnhanced(config)
     model = model.to(device)
     
     # Get model size for memory calculations
@@ -518,12 +464,27 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
     print(f"Initializing popularity bias with item frequencies (max freq: {item_frequencies.max().item():.0f})")
     model.initialize_popularity(item_frequencies.to(device))
     
+    # Calculate recent popularity scores using most recent 20 days of training data
+    if hasattr(model, 'set_recent_popularity'):
+        print("\n🔥 Calculating recent popularity boost...")
+        from utils.recent_popularity import get_recent_popularity_from_samples
+        recent_popularity, stats = get_recent_popularity_from_samples(
+            samples=train_samples,
+            num_packages=num_packages,
+            days=20  # Use most recent 20 days
+        )
+        model.set_recent_popularity(recent_popularity)
+        print(f"🔥 Recent popularity applied with weight: {model.recent_popularity_weight}")
+    else:
+        print("⚠️  Model does not support recent popularity boost")
+    
     # Create custom optimizer with different learning rates for user components
     print("Creating custom optimizer with enhanced user learning...")
     
     # Separate parameters for different learning rates
     user_params = []
     user_transform_params = []
+    user_price_bias_params = []
     other_params = []
     
     for name, param in model.named_parameters():
@@ -531,24 +492,41 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
             user_params.append(param)
         elif 'user_transform' in name:
             user_transform_params.append(param)
+        elif 'user_price_bias' in name:
+            user_price_bias_params.append(param)
         else:
             other_params.append(param)
     
     # Create optimizer with different learning rates
     user_lr = learning_rate * 2.0  # 2x learning rate for user embeddings
     user_transform_lr = learning_rate * 10.0  # 10x learning rate for user transform
+    price_bias_lr = learning_rate * 3.0  # 3x learning rate for price bias
     
-    optimizer = torch.optim.Adam([
-        {'params': other_params, 'lr': learning_rate, 'weight_decay': 1e-4},  # Increased regularization
-        {'params': user_params, 'lr': user_lr, 'weight_decay': 1e-5},  # Moderate regularization for users
-        {'params': user_transform_params, 'lr': user_transform_lr, 'weight_decay': 1e-5}  # Moderate regularization
-    ])
+    param_groups = [
+        {'params': other_params, 'lr': learning_rate, 'weight_decay': 1e-4},
+        {'params': user_params, 'lr': user_lr, 'weight_decay': 1e-5},
+        {'params': user_transform_params, 'lr': user_transform_lr, 'weight_decay': 1e-5}
+    ]
+    
+    # Add price bias parameters if they exist
+    if user_price_bias_params:
+        param_groups.append({
+            'params': user_price_bias_params, 
+            'lr': price_bias_lr, 
+            'weight_decay': 1e-4
+        })
+    
+    optimizer = torch.optim.Adam(param_groups)
     
     print(f"  Base learning rate: {learning_rate}")
     print(f"  User embedding learning rate: {user_lr}")
     print(f"  User transform learning rate: {user_transform_lr}")
+    if user_price_bias_params:
+        print(f"  User price bias learning rate: {price_bias_lr}")
     print(f"  User embedding params: {sum(p.numel() for p in user_params)}")
     print(f"  User transform params: {sum(p.numel() for p in user_transform_params)}")
+    if user_price_bias_params:
+        print(f"  User price bias params: {sum(p.numel() for p in user_price_bias_params)}")
     print(f"  Other params: {sum(p.numel() for p in other_params)}")
     
     # Create AMP manager and gradient accumulator
@@ -558,34 +536,33 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
         amp_manager=amp_manager
     )
     
-    # Create loss function
+    # Create loss function with same weights as other scripts
     loss_fn = NaturalPurchaseLoss(
-        purchase_boost=10.0  # Moderate boost - balance between class imbalance and overfitting
+        purchase_boost=5.0  # Use default weight from loss_functions.py for consistency
     )
     
     # Set up checkpointing
     os.makedirs('checkpoints/natr', exist_ok=True)
     
+    # Record training start time
+    start_time = time.time()
+    
     # Training loop
     print("\n9. Starting training...")
     best_purchase_recall = 0.0
-    best_purchase_mrr = 0.0  # Track best purchase MRR for tiebreaking
+    best_purchase_mrr = 0.0
     patience = 10 if performance_mode != "fastest" else 5
     epochs_without_improvement = 0
-    
-    # Print initial memory stats
-    if memory_optimizer.track_memory:
-        print_memory_stats(device, "Training Start")
     
     for epoch in range(num_epochs):
         print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
         
-        # Disable verbose debug monitoring after first 3 epochs to reduce clutter
-        if epoch >= 3 and hasattr(model, 'monitor_user_learning'):
+        # Disable verbose monitoring after first 3 epochs
+        if epoch >= 3:
             model.monitor_user_learning = False
         
         # Training
-        train_loss = train_epoch_with_memory_optimization(
+        train_loss = train_epoch(
             model, train_loader, optimizer, loss_fn, device, epoch,
             memory_optimizer, amp_manager, gradient_accumulator
         )
@@ -597,22 +574,28 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
             model, test_loader, device, memory_optimizer, k_values=[5, 10, 20]
         )
         
-        # Print detailed metrics
+        # Print key metrics only
         print("\nEvaluation Results:")
         print(f"  Purchase Recall@10: {metrics.get('purchase_recall@10', 0)*100:.2f}%")
         print(f"  Purchase Recall@20: {metrics.get('purchase_recall@20', 0)*100:.2f}%")
-        print(f"  Checkout Recall@10: {metrics.get('checkout_recall@10', 0)*100:.2f}%")
         print(f"  Checkout Recall@20: {metrics.get('checkout_recall@20', 0)*100:.2f}%")
-        print(f"  Add-to-Cart Recall@10: {metrics.get('add_to_cart_recall@10', 0)*100:.2f}%")
-        print(f"  Add-to-Cart Recall@20: {metrics.get('add_to_cart_recall@20', 0)*100:.2f}%")
-        print(f"  Weighted Recall@10: {metrics.get('weighted_recall@10', 0)*100:.2f}%")
-        print(f"  Weighted Recall@20: {metrics.get('weighted_recall@20', 0)*100:.2f}%")
         print(f"  Item Coverage@20: {metrics.get('item_coverage@20', 0)*100:.2f}%")
         print(f"  Purchase MRR: {metrics.get('purchase_mrr', 0):.4f}")
         
         # Track best metrics - using Purchase Recall@20 as primary metric
         current_purchase_recall_20 = metrics.get('purchase_recall@20', 0)
         current_purchase_mrr = metrics.get('purchase_mrr', 0)
+        
+        # Save metrics for convergence visualization
+        metrics_history.append({
+            'epoch': epoch + 1,
+            'purchase_recall@10': metrics.get('purchase_recall@10', 0),
+            'purchase_recall@20': metrics.get('purchase_recall@20', 0),
+            'purchase_mrr': metrics.get('purchase_mrr', 0),
+            'item_coverage@20': metrics.get('item_coverage@20', 0),
+            'checkout_recall@20': metrics.get('checkout_recall@20', 0),
+            'train_loss': train_loss
+        })
         
         # Combined improvement metric: prioritize Purchase Recall@20, use Purchase MRR as tiebreaker
         # Use epsilon for floating-point comparison to avoid precision issues
@@ -634,7 +617,7 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
                 'config': config.__dict__,
                 'metrics': metrics,
                 'train_loss': train_loss
-            }, 'checkpoints/natr/best_model.pth')
+            }, f'checkpoints/natr/best_model_{model_name}.pth')
             print(f"✓ New best model saved! Purchase Recall@20: {best_purchase_recall*100:.2f}%, Purchase MRR: {best_purchase_mrr:.4f}")
         else:
             epochs_without_improvement += 1
@@ -656,45 +639,49 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None):
             print(f"\nEarly stopping triggered after {patience} epochs without improvement")
             break
     
+    # Calculate training duration
+    end_time = time.time()
+    training_duration = end_time - start_time
+    
+    # Save model info with timing
+    model_info = {
+        'model_type': model_name,
+        'training_type': 'oversampled' if use_oversampling else 'baseline',
+        'oversample_factor': oversample_purchases if use_oversampling else 1,
+        'config': config.__dict__,
+        'best_purchase_recall@20': best_purchase_recall,
+        'best_purchase_mrr': best_purchase_mrr,
+        'training_duration_seconds': training_duration,
+        'training_duration_minutes': training_duration / 60,
+        'training_duration_formatted': f"{training_duration//3600:.0f}h {(training_duration%3600)//60:.0f}m {training_duration%60:.0f}s",
+        'checkpoint_path': f'checkpoints/natr/best_model_{model_name}.pth'
+    }
+    
+    output_dir = 'output/model_info' if dataset == '13months' else 'output/model_info_2months'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    model_info_path = os.path.join(output_dir, f'model_info_{model_name}.json')
+    with open(model_info_path, 'w') as f:
+        json.dump(model_info, f, indent=2)
+    
+    # Save metrics history for convergence visualization
+    graphs_output_dir = 'output/graphs_data'
+    os.makedirs(graphs_output_dir, exist_ok=True)
+    
+    metrics_file = os.path.join(graphs_output_dir, f'{model_name}_metrics_history.json')
+    with open(metrics_file, 'w') as f:
+        json.dump(metrics_history, f, indent=2)
+    print(f"📊 Saved metrics history to: {metrics_file}")
+    
     # Final summary
     print("\n10. Training complete!")
     print(f"Best Purchase Recall@20: {best_purchase_recall*100:.2f}%")
     print(f"Best Purchase MRR: {best_purchase_mrr:.4f}")
-    
-    # Save model info
-    model_info = {
-        'config': config.__dict__,
-        'valid_packages': list(valid_packages),
-        'best_purchase_recall_20': best_purchase_recall,
-        'best_purchase_mrr': best_purchase_mrr,
-        'checkpoint_path': 'checkpoints/natr/best_model.pth',
-        'package_data_path': package_data_path,
-        'event_data_path': event_data_path,
-        'performance_mode': performance_mode,
-        'device_type': device_type,
-        'training_date': datetime.now().strftime("%Y-%m-%d"),
-        'package_count': len(valid_packages),
-        'user_count': num_users,
-        'model_size_mb': model_size_mb,
-        'split_date': split_date,  # Save the train/test split date
-        'train_ratio': 0.91  # Save the train ratio used
-    }
-    
-    # Save model info to appropriate directory based on dataset
-    output_dir = 'output/model_info' if args.dataset == '13months' else 'output/model_info_2months'
-    os.makedirs(output_dir, exist_ok=True)
-    
-    with open(os.path.join(output_dir, 'model_info.json'), 'w') as f:
-        json.dump(model_info, f, indent=2)
+    print(f"Training Duration: {model_info['training_duration_formatted']}")
     
     print("\nFiles saved:")
-    print("  - checkpoints/natr/best_model.pth")
-    print("  - checkpoints/natr/model_epoch_X.pth")
-    print("  - model_info.json")
-    
-    # Final memory stats
-    if memory_optimizer.track_memory:
-        print_memory_stats(device, "Training Complete")
+    print(f"  - checkpoints/natr/best_model_{model_name}.pth")
+    print(f"  - {model_info_path}")
 
 
 if __name__ == "__main__":
@@ -702,7 +689,7 @@ if __name__ == "__main__":
     import argparse
     
     # Set up argument parser
-    parser = argparse.ArgumentParser(description='Train NATR model with enhanced memory optimization')
+    parser = argparse.ArgumentParser(description='Train baseline NATR model')
     parser.add_argument('--mode', type=str, default='balanced', 
                         choices=['fastest', 'balanced', 'accurate'],
                         help='Performance mode (default: balanced)')
@@ -717,28 +704,17 @@ if __name__ == "__main__":
                         help='Number of training epochs (default: 50)')
     parser.add_argument('--learning-rate', type=float, default=None,
                         help='Override learning rate (default: determined by mode)')
+    parser.add_argument('--oversample-purchases', type=int, default=1,
+                        help='Oversample purchase samples by this factor (default: 1 = no oversampling)')
+    parser.add_argument('--oversample', action='store_true',
+                        help='Enable 2x purchase oversampling (shortcut for --oversample-purchases 2)')
     
-    # Parse arguments while maintaining backward compatibility
-    if len(sys.argv) > 1 and sys.argv[1] in ["fastest", "balanced", "accurate"]:
-        # Old style: just the mode as first argument
-        performance_mode = sys.argv[1]
-        args = parser.parse_args([])
-        args.mode = performance_mode
-    else:
-        # New style: proper argument parsing
-        args = parser.parse_args()
+    args = parser.parse_args()
     
-    # Check for Apple Silicon and optimize automatically
-    is_mps = torch.backends.mps.is_available()
-    if is_mps:
-        print("Apple Silicon (MPS) device detected! Using optimized settings.")
-    
-    # Override with command-line arguments if provided
-    if args.batch_size is not None:
-        print(f"Overriding batch size to {args.batch_size}")
-    
-    if args.learning_rate is not None:
-        print(f"Overriding learning rate to {args.learning_rate}")
+    # Handle --oversample flag
+    if args.oversample:
+        args.oversample_purchases = 2
     
     # Run training
-    main(performance_mode=args.mode, dataset=args.dataset, event_data_path=args.event_data)
+    main(performance_mode=args.mode, dataset=args.dataset, event_data_path=args.event_data,
+         oversample_purchases=args.oversample_purchases)

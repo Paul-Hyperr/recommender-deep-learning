@@ -33,12 +33,11 @@ from collections import defaultdict
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.natr import NATR, NATRConfig
-from utils.session_processor import SessionProcessor
+from models.natr_enhanced import NATREnhanced, NATRConfig
+from utils.session_processor2 import SessionProcessor2
 from utils.package_processor import PackageProcessor
 from utils.unified_metrics import UnifiedMetricsTracker
 from utils.training_utils import create_dataloaders, move_batch_to_device
-from scripts.evaluate_recommendations import RecommendationEvaluator
 
 
 class ComprehensiveMultiViewAnalyzer:
@@ -61,19 +60,52 @@ class ComprehensiveMultiViewAnalyzer:
         with open(model_info_path, 'r') as f:
             self.model_info = json.load(f)
         
-        # Initialize evaluator (for ablation studies)
-        self.evaluator = RecommendationEvaluator(model_info_path)
-        self.device = self.evaluator.device
-        self.model = self.evaluator.recommender.model
+        # Device setup
+        self.device = torch.device('cuda' if torch.cuda.is_available() 
+                                  else 'mps' if torch.backends.mps.is_available() 
+                                  else 'cpu')
         
-        # Feature groups for analysis
+        # Load the enhanced model directly from checkpoint
+        print(f"Loading enhanced model from checkpoint...")
+        checkpoint_path = 'checkpoints/natr_enhanced/finetuned_model.pth'
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
+        
+        # Create model config from model_info
+        config = NATRConfig(
+            num_users=self.model_info['config']['num_users'],
+            num_packages=self.model_info['config']['num_packages'],
+            num_countries=self.model_info['config']['num_countries'],
+            num_categories=self.model_info['config']['num_categories'],
+            num_themes=self.model_info['config']['num_themes'],
+            title_embedding_dim=self.model_info['config']['title_embedding_dim'],
+            hidden_dim=self.model_info['config']['hidden_dim'],
+            embedding_dim=self.model_info['config']['embedding_dim'],
+            user_embedding_dim=self.model_info['config']['user_embedding_dim'],
+            dropout=self.model_info['config']['dropout'],
+            max_short_term=self.model_info['config']['max_short_term'],
+            max_long_term=self.model_info['config']['max_long_term']
+        )
+        
+        # Initialize and load model
+        self.model = NATREnhanced(config)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.to(self.device)
+        self.model.eval()
+        
+        print(f"Model loaded successfully from {checkpoint_path}")
+        
+        # Feature groups for analysis (7-view enhanced model matching exact implementation)
+        # Order matches the model: [title, coordinates, country, category/theme, price, time, events]
         self.feature_groups = {
-            'title_embeddings': 'Title Embeddings',
-            'coordinates': 'Geographic Coordinates',
-            'country': 'Country',
-            'category': 'Category', 
-            'theme': 'Theme',
-            'price': 'Price'
+            'title_embeddings': 'Title Embeddings',           # View 0
+            'coordinates': 'Geographic Coordinates',          # View 1  
+            'country': 'Country',                            # View 2
+            'category_theme': 'Category/Theme (Combined)',   # View 3 - COMBINED
+            'price': 'Price',                               # View 4
+            'time': 'Temporal Information',                 # View 5 - MISSING before
+            'events': 'Events/Interactions'                 # View 6
         }
         
         # Results storage
@@ -91,20 +123,105 @@ class ComprehensiveMultiViewAnalyzer:
         print("RUNNING FEATURE ABLATION STUDY")
         print(f"{'='*60}")
         
-        # Prepare test data
-        if self.sample_size is None:
-            print(f"\nPreparing test data (using all purchase samples)...")
-            test_loader, test_samples = self.evaluator.prepare_test_data(
-                sample_size=None,
-                purchases_only=True  # Focus on purchase prediction
-            )
-            self.sample_size = len(test_samples)  # Update with actual size
+        # Prepare test data using same approach as verification script
+        print(f"\nPreparing test data for ablation study...")
+        
+        # Data paths
+        event_data = self.model_info.get('event_data_path', 'data/13_months_new2_clean.parquet')
+        package_data_path = self.model_info.get('package_data_path', 'data/feed.parquet')
+        
+        # Initialize processors exactly like training script
+        package_processor = PackageProcessor(
+            feed_data_path=package_data_path,
+            cache_dir='data/cache',
+            load_coordinates=True,
+            load_embeddings=True,
+            api_key=os.environ.get("OPENAI_API_KEY"),
+            embedding_model='text-embedding-3-small',
+            use_reduced_embeddings=True
+        )
+        
+        session_processor = SessionProcessor2(
+            event_data_path=event_data,
+            cache_dir='data/cache',
+            session_timeout_hours=30,
+            min_interactions=8,  # Match training script
+            max_sessions_per_user=20,
+            max_samples_per_user=10
+        )
+        
+        # Load and process data (will use cache if available)
+        print("Loading and processing data (using cache if available)...")
+        package_processor.load_data()
+        session_processor.load_data()
+        
+        package_processor.create_mappings()
+        session_processor.create_mappings()
+        
+        session_processor.extract_sessions()
+        
+        # Prepare samples
+        from utils.training_utils import (
+            filter_by_min_session_length, filter_items_by_frequency,
+            identify_event_types, time_based_split_year
+        )
+        
+        all_samples = session_processor.prepare_enhanced_training_data()
+        
+        # Identify event types
+        event_to_idx = session_processor.get_idx_mappings()['event_to_idx']
+        all_samples = identify_event_types(all_samples, event_to_idx)
+        
+        # Apply same filters as training
+        quality_samples = filter_by_min_session_length(all_samples, min_session_length=2)
+        
+        # Use exact same valid packages from training
+        valid_packages = set(self.model_info.get('valid_packages', []))
+        if valid_packages:
+            filtered_samples = []
+            for sample in quality_samples:
+                if str(sample.get('purchased_package', '')) in valid_packages:
+                    filtered_samples.append(sample)
         else:
-            print(f"\nPreparing test data (sample size: {self.sample_size})...")
-            test_loader, test_samples = self.evaluator.prepare_test_data(
-                sample_size=self.sample_size,
-                purchases_only=True  # Focus on purchase prediction
-            )
+            filtered_samples, valid_packages = filter_items_by_frequency(quality_samples, min_frequency=5)
+        
+        # Use exact same split as training
+        train_ratio = self.model_info.get('train_ratio', 0.91)
+        train_samples, test_samples, split_date = time_based_split_year(filtered_samples, train_ratio=train_ratio)
+        
+        # Get only purchase samples from test set
+        test_purchases = [s for s in test_samples if s.get('is_purchase', False)]
+        
+        # Filter for warm-start users only (users present in both train and test sets)
+        print("Filtering for warm-start users (present in both train and test)...")
+        train_users = set(sample['user_id'] for sample in train_samples)
+        warm_start_purchases = [s for s in test_purchases if s['user_id'] in train_users]
+        
+        print(f"Total test purchases: {len(test_purchases)}")
+        print(f"Warm-start test purchases: {len(warm_start_purchases)} ({len(warm_start_purchases)/len(test_purchases)*100:.1f}%)")
+        
+        # Use warm-start purchases for analysis
+        test_purchases = warm_start_purchases
+        
+        if self.sample_size is not None and self.sample_size < len(test_purchases):
+            import random
+            random.seed(42)
+            test_purchases = random.sample(test_purchases, self.sample_size)
+        
+        print(f"Using {len(test_purchases)} warm-start test purchase samples for ablation study")
+        
+        # Create dataloader
+        dummy_train_samples = test_purchases[:100] if len(test_purchases) > 100 else test_purchases
+        
+        train_loader, test_loader = create_dataloaders(
+            train_samples=dummy_train_samples,
+            test_samples=test_purchases,
+            package_processor=package_processor,
+            session_processor=session_processor,
+            batch_size=64,
+            num_workers=0,
+            use_weighted_sampling=False
+        )
         
         results = []
         
@@ -193,14 +310,32 @@ class ComprehensiveMultiViewAnalyzer:
                                 features['title_embeddings'] = torch.zeros_like(features['title_embeddings'])
                             elif feature_to_mask == 'coordinates' and 'coordinates' in features:
                                 features['coordinates'] = torch.zeros_like(features['coordinates'])
-                            elif feature_to_mask == 'country' and 'country_ids' in features:
-                                features['country_ids'] = torch.zeros_like(features['country_ids'])
-                            elif feature_to_mask == 'category' and 'category_ids' in features:
-                                features['category_ids'] = torch.zeros_like(features['category_ids'])
-                            elif feature_to_mask == 'theme' and 'theme_ids' in features:
-                                features['theme_ids'] = torch.zeros_like(features['theme_ids'])
-                            elif feature_to_mask == 'price' and 'prices' in features:
-                                features['prices'] = torch.zeros_like(features['prices'])
+                            elif feature_to_mask == 'country':
+                                # Mask ALL country-related features
+                                for country_field in ['country_ids', 'purchased_countries', 'short_term_countries', 'long_term_countries']:
+                                    if country_field in features:
+                                        features[country_field] = torch.zeros_like(features[country_field])
+                            elif feature_to_mask == 'category_theme':
+                                # Mask ALL category and theme related features since they're combined in view 3
+                                category_fields = ['category_ids', 'purchased_categories', 'short_term_categories', 'long_term_categories']
+                                theme_fields = ['theme_ids', 'purchased_themes', 'short_term_themes', 'long_term_themes']
+                                for field in category_fields + theme_fields:
+                                    if field in features:
+                                        features[field] = torch.zeros_like(features[field])
+                            elif feature_to_mask == 'price':
+                                # Mask ALL price-related features
+                                for price_field in ['prices', 'purchased_prices', 'short_term_prices', 'long_term_prices']:
+                                    if price_field in features:
+                                        features[price_field] = torch.zeros_like(features[price_field])
+                            elif feature_to_mask == 'time':
+                                # Mask ALL temporal information
+                                for time_field in ['timestamps', 'purchased_timestamps', 'short_term_timestamps', 'long_term_timestamps']:
+                                    if time_field in features:
+                                        features[time_field] = torch.zeros_like(features[time_field])
+                            elif feature_to_mask == 'events':
+                                # Mask event-related features in the batch (event_types in enhanced model)
+                                if 'event_types' in features:
+                                    features['event_types'] = torch.zeros_like(features['event_types'])
                 return input
             
             # Register hook on PackageEncoder
@@ -285,10 +420,26 @@ class ComprehensiveMultiViewAnalyzer:
             price_params = 0
             if hasattr(self.model.package_encoder, 'price_encoder'):
                 price_params = sum(p.numel() for p in self.model.package_encoder.price_encoder.parameters())
+                
+            # Time encoder parameters (new view)
+            time_params = 0
+            if hasattr(self.model.package_encoder, 'time_encoder'):
+                time_params = sum(p.numel() for p in self.model.package_encoder.time_encoder.parameters())
+                
+            # Events encoder parameters (in package_encoder in enhanced model)
+            events_params = 0
+            if hasattr(self.model.package_encoder, 'event_embedding'):
+                events_params += self.model.package_encoder.event_embedding.weight.numel()
+            if hasattr(self.model.package_encoder, 'event_lstm'):
+                events_params += sum(p.numel() for p in self.model.package_encoder.event_lstm.parameters())
+            if hasattr(self.model.package_encoder, 'event_attention'):
+                events_params += sum(p.numel() for p in self.model.package_encoder.event_attention.parameters())
+            if hasattr(self.model.package_encoder, 'event_projection'):
+                events_params += sum(p.numel() for p in self.model.package_encoder.event_projection.parameters())
             
             # Calculate total and percentages
             total_params = (country_params + category_params + theme_params + 
-                          title_params + coord_params + price_params)
+                          title_params + coord_params + price_params + time_params + events_params)
             
             if total_params > 0:
                 results.append({
@@ -310,22 +461,28 @@ class ComprehensiveMultiViewAnalyzer:
                     'embedding_dim': country_size
                 })
                 results.append({
-                    'feature': 'Category',
-                    'parameters': category_params,
-                    'param_percentage': (category_params / total_params) * 100,
-                    'embedding_dim': category_size
-                })
-                results.append({
-                    'feature': 'Theme',
-                    'parameters': theme_params,
-                    'param_percentage': (theme_params / total_params) * 100,
-                    'embedding_dim': theme_size
+                    'feature': 'Category/Theme (Combined)',
+                    'parameters': category_params + theme_params,  # Combined parameters
+                    'param_percentage': ((category_params + theme_params) / total_params) * 100,
+                    'embedding_dim': max(category_size, theme_size)  # Larger of the two
                 })
                 results.append({
                     'feature': 'Price',
                     'parameters': price_params,
                     'param_percentage': (price_params / total_params) * 100,
                     'embedding_dim': self.model_info['config'].get('hidden_dim', 256)  # Output of price_encoder
+                })
+                results.append({
+                    'feature': 'Temporal Information',
+                    'parameters': time_params,
+                    'param_percentage': (time_params / total_params) * 100,
+                    'embedding_dim': self.model_info['config'].get('hidden_dim', 256)  # Output of time_encoder
+                })
+                results.append({
+                    'feature': 'Events/Interactions',
+                    'parameters': events_params,
+                    'param_percentage': (events_params / total_params) * 100,
+                    'embedding_dim': self.model_info['config'].get('hidden_dim', 256)  # Output of event components
                 })
                 
                 print(f"\nParameter allocation analysis:")
@@ -346,6 +503,7 @@ class ComprehensiveMultiViewAnalyzer:
         # Set style
         plt.style.use('seaborn-v0_8-whitegrid')
         colors = plt.cm.Set3(np.linspace(0, 1, 12))
+        view_colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57', '#FF9FF3', '#54A0FF']
         
         # Create large figure with multiple subplots
         fig = plt.figure(figsize=(20, 16))
@@ -468,9 +626,9 @@ class ComprehensiveMultiViewAnalyzer:
         ax6.axis('off')
         
         # Create architecture flow diagram
-        y_positions = np.linspace(0.9, 0.1, 6)
+        y_positions = np.linspace(0.95, 0.05, 7)
         feature_labels = ['Title\nEmbeddings', 'Geographic\nCoordinates', 
-                         'Country', 'Category', 'Theme', 'Price']
+                         'Country', 'Category', 'Theme', 'Price', 'Events/\nInteractions']
         
         # Draw feature boxes
         for i, (feat, y) in enumerate(zip(feature_labels, y_positions)):
@@ -577,6 +735,157 @@ class ComprehensiveMultiViewAnalyzer:
         
         return fig
     
+    def create_view_influence_graph(self):
+        """Create a focused visualization showing the influence of each view"""
+        print(f"\n{'='*60}")
+        print("CREATING VIEW INFLUENCE VISUALIZATION")
+        print(f"{'='*60}")
+        
+        if self.ablation_results is None:
+            print("Error: No ablation results available. Run ablation study first.")
+            return None
+        
+        # Set up the figure
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # Enhanced color scheme for 7 views
+        view_colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57', '#FF9FF3', '#54A0FF']
+        
+        # Get feature results (excluding baseline)
+        feature_results = self.ablation_results[self.ablation_results['feature'] != 'Baseline (All Features)'].copy()
+        feature_results = feature_results.sort_values('relative_importance', ascending=True)
+        
+        # 1. View Influence Bar Chart (Horizontal)
+        bars1 = ax1.barh(feature_results['feature'], feature_results['relative_importance'], 
+                        color=view_colors[:len(feature_results)], alpha=0.8, edgecolor='black', linewidth=0.5)
+        
+        ax1.set_xlabel('Performance Impact (%)\n(Performance drop when view is removed)', fontsize=12, fontweight='bold')
+        ax1.set_title('Multi-View Influence Analysis\nHow much each view contributes to model performance', 
+                     fontsize=14, fontweight='bold', pad=20)
+        ax1.grid(axis='x', alpha=0.3)
+        
+        # Add value labels on bars
+        for i, (bar, val) in enumerate(zip(bars1, feature_results['relative_importance'])):
+            ax1.text(val + 0.2, bar.get_y() + bar.get_height()/2, f'{val:.1f}%', 
+                    va='center', fontweight='bold', fontsize=10)
+        
+        # Add average line
+        avg_importance = feature_results['relative_importance'].mean()
+        ax1.axvline(avg_importance, color='red', linestyle='--', alpha=0.7, linewidth=2)
+        ax1.text(avg_importance + 0.5, len(feature_results)-0.5, f'Avg: {avg_importance:.1f}%', 
+                rotation=90, va='top', ha='left', color='red', fontweight='bold')
+        
+        # 2. Recall@20 Performance Comparison
+        baseline_recall = self.ablation_results[
+            self.ablation_results['feature'] == 'Baseline (All Features)'
+        ]['recall@20'].iloc[0] * 100
+        
+        bars2 = ax2.bar(range(len(feature_results)), feature_results['recall@20'] * 100, 
+                       color=view_colors[:len(feature_results)], alpha=0.8, edgecolor='black', linewidth=0.5)
+        
+        # Add baseline line
+        ax2.axhline(baseline_recall, color='green', linestyle='-', linewidth=3, alpha=0.7, 
+                   label=f'All Views: {baseline_recall:.1f}%')
+        
+        ax2.set_xlabel('View Removed', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Recall@20 (%)', fontsize=12, fontweight='bold')
+        ax2.set_title('Performance When Each View is Removed\n(Higher is better)', 
+                     fontsize=14, fontweight='bold', pad=20)
+        ax2.set_xticks(range(len(feature_results)))
+        ax2.set_xticklabels(feature_results['feature'], rotation=45, ha='right')
+        ax2.legend(fontsize=11)
+        ax2.grid(axis='y', alpha=0.3)
+        
+        # Add value labels on bars
+        for bar, val in zip(bars2, feature_results['recall@20'] * 100):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5, f'{val:.1f}%', 
+                    ha='center', va='bottom', fontweight='bold', fontsize=9)
+        
+        # 3. Radar Chart for Multi-Metric View Impact
+        if len(feature_results) > 0:
+            # Prepare data for radar chart
+            categories = ['Recall@10', 'Recall@20', 'MRR']
+            
+            # Normalize metrics to 0-100 scale for better visualization
+            metrics_data = []
+            for _, row in feature_results.iterrows():
+                metrics_data.append([
+                    row['recall@10_drop'] * 1000,  # Scale up for visibility
+                    row['recall@20_drop'] * 1000,
+                    row['mrr_drop'] * 1000
+                ])
+            
+            # Create polar subplot
+            ax3 = plt.subplot(2, 2, 3, projection='polar')
+            
+            # Number of variables
+            N = len(categories)
+            angles = [n / float(N) * 2 * np.pi for n in range(N)]
+            angles += angles[:1]  # Complete the circle
+            
+            # Plot each feature
+            for i, (feature_name, data) in enumerate(zip(feature_results['feature'], metrics_data)):
+                values = data + [data[0]]  # Complete the circle
+                ax3.plot(angles, values, 'o-', linewidth=2, 
+                        label=feature_name, color=view_colors[i], alpha=0.7)
+                ax3.fill(angles, values, alpha=0.25, color=view_colors[i])
+            
+            # Add category labels
+            ax3.set_xticks(angles[:-1])
+            ax3.set_xticklabels(categories, fontsize=11)
+            ax3.set_title('Multi-Metric Impact Profile\n(Performance drops when views removed)', 
+                         fontsize=14, fontweight='bold', pad=30)
+            ax3.legend(loc='upper right', bbox_to_anchor=(1.2, 1.0), fontsize=9)
+            ax3.grid(True, alpha=0.3)
+        
+        # 4. View Importance Ranking with Confidence Intervals
+        # Sort by importance for ranking
+        ranked_features = feature_results.sort_values('relative_importance', ascending=False)
+        
+        # Create ranking visualization
+        y_pos = np.arange(len(ranked_features))
+        importance_vals = ranked_features['relative_importance'].values
+        
+        # Create error bars based on MRR variation (as proxy for confidence)
+        error_vals = np.abs(ranked_features['mrr_drop'].values) * 50  # Scale for visibility and ensure positive
+        
+        bars4 = ax4.barh(y_pos, importance_vals, 
+                        color=view_colors[:len(ranked_features)], alpha=0.8, 
+                        edgecolor='black', linewidth=0.5)
+        
+        # Add error bars
+        ax4.errorbar(importance_vals, y_pos, xerr=error_vals, fmt='none', 
+                    ecolor='black', alpha=0.5, capsize=3)
+        
+        ax4.set_yticks(y_pos)
+        ax4.set_yticklabels([f"#{i+1}. {name}" for i, name in enumerate(ranked_features['feature'])])
+        ax4.set_xlabel('View Importance Score (%)', fontsize=12, fontweight='bold')
+        ax4.set_title('View Importance Ranking\n(Most to least critical for performance)', 
+                     fontsize=14, fontweight='bold', pad=20)
+        ax4.grid(axis='x', alpha=0.3)
+        
+        # Add value labels
+        for i, (bar, val) in enumerate(zip(bars4, importance_vals)):
+            ax4.text(val + 0.5, bar.get_y() + bar.get_height()/2, f'{val:.1f}%', 
+                    va='center', fontweight='bold', fontsize=10)
+        
+        # Main title
+        model_name = self.model_info.get('model_type', 'NATR Enhanced Model')
+        plt.suptitle(f'7-View Architecture Performance Analysis\n{model_name}', 
+                    fontsize=18, fontweight='bold', y=0.98)
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # Save the focused view influence graph
+        output_dir = 'output/analyze_learning'
+        os.makedirs(output_dir, exist_ok=True)
+        
+        output_path = os.path.join(output_dir, 'view_influence_analysis.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"\nView influence visualization saved to: {output_path}")
+        
+        return fig
+    
     def _generate_insights_text(self) -> str:
         """Generate insights text based on analysis results"""
         insights = ["Multi-View Learning Insights:\n"]
@@ -654,14 +963,18 @@ class ComprehensiveMultiViewAnalyzer:
         # 3. Create comprehensive visualization
         self.create_comprehensive_visualization()
         
-        # 4. Save all results
+        # 4. Create focused view influence graph
+        self.create_view_influence_graph()
+        
+        # 5. Save all results
         self.save_results()
         
         print(f"\n{'='*80}")
         print("ANALYSIS COMPLETE!")
         print(f"{'='*80}")
         print("Generated files in output/analyze_learning/:")
-        print("- comprehensive_multiview_analysis.png (main visualization)")
+        print("- comprehensive_multiview_analysis.png (full analysis)")
+        print("- view_influence_analysis.png (focused view influence graph)")
         print("- multiview_ablation_results.csv (ablation study data)")
         print("- multiview_architecture_analysis.csv (architecture data)")
 
