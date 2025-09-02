@@ -45,15 +45,17 @@ class ComprehensiveMultiViewAnalyzer:
     Comprehensive analyzer for NATR's multi-view learning effectiveness
     """
     
-    def __init__(self, model_info_path: str, sample_size: Optional[int] = None):
+    def __init__(self, model_info_path: str, checkpoint_path: str, sample_size: Optional[int] = None):
         """
         Initialize the analyzer
         
         Args:
             model_info_path: Path to model_info.json
+            checkpoint_path: Path to model checkpoint file (.pth)
             sample_size: Number of samples to use for ablation analysis (None = all purchases)
         """
         self.model_info_path = model_info_path
+        self.checkpoint_path = checkpoint_path
         self.sample_size = sample_size
         
         # Load model info
@@ -65,11 +67,11 @@ class ComprehensiveMultiViewAnalyzer:
                                   else 'mps' if torch.backends.mps.is_available() 
                                   else 'cpu')
         
-        # Load the enhanced model directly from checkpoint
-        print(f"Loading enhanced model from checkpoint...")
-        checkpoint_path = 'checkpoints/natr_enhanced/finetuned_model.pth'
+        # Validate checkpoint path
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
+        
+        print(f"Loading model from checkpoint: {checkpoint_path}")
         
         # Create model config from model_info
         config = NATRConfig(
@@ -90,27 +92,58 @@ class ComprehensiveMultiViewAnalyzer:
         # Initialize and load model
         self.model = NATREnhanced(config)
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Check if checkpoint matches expected model dimensions
+        checkpoint_config = checkpoint.get('config', {})
+        expected_users = self.model_info['config']['num_users']
+        expected_packages = self.model_info['config']['num_packages']
+        checkpoint_users = checkpoint_config.get('num_users', 0)
+        checkpoint_packages = checkpoint_config.get('num_packages', 0)
+        
+        if (checkpoint_users != expected_users or checkpoint_packages != expected_packages):
+            print(f"🚨 WARNING: Checkpoint mismatch!")
+            print(f"   Expected: {expected_users:,} users, {expected_packages:,} packages")
+            print(f"   Checkpoint: {checkpoint_users:,} users, {checkpoint_packages:,} packages")
+            print(f"   This checkpoint appears to be from a different dataset.")
+            print(f"   Analysis will continue but results may not be accurate.")
+            response = input("Do you want to continue anyway? (y/n): ")
+            if response.lower() != 'y':
+                raise RuntimeError("Analysis aborted due to checkpoint mismatch")
+        
+        try:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"✅ Model loaded successfully with matching dimensions")
+        except RuntimeError as e:
+            print(f"Warning: Model architecture mismatch. Loading with strict=False...")
+            print(f"Error details: {str(e)[:200]}...")
+            # Load with strict=False to ignore size mismatches
+            missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            if missing_keys:
+                print(f"Missing keys: {len(missing_keys)} parameters")
+            if unexpected_keys:
+                print(f"Unexpected keys: {len(unexpected_keys)} parameters") 
+            print("Continuing with partial model loading...")
+        
         self.model.to(self.device)
         self.model.eval()
         
         print(f"Model loaded successfully from {checkpoint_path}")
         
-        # Feature groups for analysis (7-view enhanced model matching exact implementation)
-        # Order matches the model: [title, coordinates, country, category/theme, price, time, events]
+        # Feature groups for analysis (6-view model, excluding temporal)
+        # Include events since they're different from temporal user encoding
         self.feature_groups = {
             'title_embeddings': 'Title Embeddings',           # View 0
             'coordinates': 'Geographic Coordinates',          # View 1  
             'country': 'Country',                            # View 2
-            'category_theme': 'Category/Theme (Combined)',   # View 3 - COMBINED
-            'price': 'Price',                               # View 4
-            'time': 'Temporal Information',                 # View 5 - MISSING before
-            'events': 'Events/Interactions'                 # View 6
+            'category_theme': 'Category/Theme',               # View 3
+            'price': 'Price',                                # View 4
+            'events': 'Events'                               # View 5
         }
         
         # Results storage
         self.ablation_results = None
         self.architecture_analysis = None
+        self.test_loader = None
         
     def run_ablation_study(self) -> pd.DataFrame:
         """
@@ -126,9 +159,31 @@ class ComprehensiveMultiViewAnalyzer:
         # Prepare test data using same approach as verification script
         print(f"\nPreparing test data for ablation study...")
         
-        # Data paths
-        event_data = self.model_info.get('event_data_path', 'data/13_months_new2_clean.parquet')
+        # Data paths - determine from model info
         package_data_path = self.model_info.get('package_data_path', 'data/feed.parquet')
+        
+        # Smart dataset detection based on model info
+        if 'event_data_path' in self.model_info:
+            event_data = self.model_info['event_data_path']
+        elif 'dataset' in self.model_info:
+            dataset_map = {
+                '13months': 'data/13_months_new2_clean.parquet',
+                '2months': 'data/bookit_events_2_months.parquet'
+            }
+            event_data = dataset_map.get(self.model_info['dataset'], 'data/13_months_new2_clean.parquet')
+        else:
+            # Detect from model dimensions (2 months has ~6k packages, 13 months has ~9k packages)
+            num_packages = self.model_info['config'].get('num_packages', 0)
+            num_users = self.model_info['config'].get('num_users', 0)
+            
+            if num_packages < 7000 or num_users < 200000:  # Likely 2 months
+                event_data = 'data/bookit_events_2_months.parquet'
+                print(f"Auto-detected 2 months dataset based on model size (packages: {num_packages}, users: {num_users})")
+            else:  # Likely 13 months
+                event_data = 'data/13_months_new2_clean.parquet'
+                print(f"Auto-detected 13 months dataset based on model size (packages: {num_packages}, users: {num_users})")
+        
+        print(f"Using event data: {event_data}")
         
         # Initialize processors exactly like training script
         package_processor = PackageProcessor(
@@ -192,23 +247,22 @@ class ComprehensiveMultiViewAnalyzer:
         # Get only purchase samples from test set
         test_purchases = [s for s in test_samples if s.get('is_purchase', False)]
         
-        # Filter for warm-start users only (users present in both train and test sets)
-        print("Filtering for warm-start users (present in both train and test)...")
+        # Use ALL test purchases (both warm-start and cold-start users)
+        print("Using all test purchases (warm-start + cold-start users)...")
         train_users = set(sample['user_id'] for sample in train_samples)
+        self.train_users = train_users  # Store for later use in attention analysis
         warm_start_purchases = [s for s in test_purchases if s['user_id'] in train_users]
+        cold_start_purchases = [s for s in test_purchases if s['user_id'] not in train_users]
         
         print(f"Total test purchases: {len(test_purchases)}")
         print(f"Warm-start test purchases: {len(warm_start_purchases)} ({len(warm_start_purchases)/len(test_purchases)*100:.1f}%)")
+        print(f"Cold-start test purchases: {len(cold_start_purchases)} ({len(cold_start_purchases)/len(test_purchases)*100:.1f}%)")
         
-        # Use warm-start purchases for analysis
-        test_purchases = warm_start_purchases
+        # Use ALL test purchases for analysis (ignore sample_size for final analysis)
+        print(f"Using ALL {len(test_purchases)} test purchase samples for ablation study")
         
-        if self.sample_size is not None and self.sample_size < len(test_purchases):
-            import random
-            random.seed(42)
-            test_purchases = random.sample(test_purchases, self.sample_size)
-        
-        print(f"Using {len(test_purchases)} warm-start test purchase samples for ablation study")
+        # Store train samples for user type evaluation
+        self.train_samples = train_samples
         
         # Create dataloader
         dummy_train_samples = test_purchases[:100] if len(test_purchases) > 100 else test_purchases
@@ -223,6 +277,13 @@ class ComprehensiveMultiViewAnalyzer:
             use_weighted_sampling=False
         )
         
+        # Store test_loader and warm-start purchases for attention analysis
+        self.test_loader = test_loader
+        self.warm_start_purchases = warm_start_purchases
+        self.test_purchases = test_purchases
+        self.package_processor = package_processor
+        self.session_processor = session_processor
+        
         results = []
         
         # Baseline performance (no masking)
@@ -231,6 +292,13 @@ class ComprehensiveMultiViewAnalyzer:
         baseline_recall_20 = baseline_metrics.get('purchase_recall@20', 0.0)
         baseline_recall_10 = baseline_metrics.get('purchase_recall@10', 0.0)
         baseline_mrr = baseline_metrics.get('purchase_mrr', 0.0)
+        
+        # Evaluate separately for warm-start and cold-start users
+        warm_metrics, cold_metrics = self._evaluate_by_user_type(test_loader)
+        
+        print(f"Overall Baseline - Recall@10: {baseline_recall_10*100:.2f}%, Recall@20: {baseline_recall_20*100:.2f}%, MRR: {baseline_mrr:.4f}")
+        print(f"Warm-start Users - Recall@10: {warm_metrics['purchase_recall@10']*100:.2f}%, Recall@20: {warm_metrics['purchase_recall@20']*100:.2f}%, MRR: {warm_metrics['purchase_mrr']:.4f}")
+        print(f"Cold-start Users - Recall@10: {cold_metrics['purchase_recall@10']*100:.2f}%, Recall@20: {cold_metrics['purchase_recall@20']*100:.2f}%, MRR: {cold_metrics['purchase_mrr']:.4f}")
         
         results.append({
             'feature': 'Baseline (All Features)',
@@ -319,19 +387,20 @@ class ComprehensiveMultiViewAnalyzer:
                                 # Mask ALL category and theme related features since they're combined in view 3
                                 category_fields = ['category_ids', 'purchased_categories', 'short_term_categories', 'long_term_categories']
                                 theme_fields = ['theme_ids', 'purchased_themes', 'short_term_themes', 'long_term_themes']
+                                masked_fields = []
                                 for field in category_fields + theme_fields:
                                     if field in features:
+                                        original_shape = features[field].shape
                                         features[field] = torch.zeros_like(features[field])
+                                        masked_fields.append(f"{field}({original_shape})")
+                                if len(masked_fields) > 0:
+                                    pass  # Removed verbose debug output
                             elif feature_to_mask == 'price':
                                 # Mask ALL price-related features
                                 for price_field in ['prices', 'purchased_prices', 'short_term_prices', 'long_term_prices']:
                                     if price_field in features:
                                         features[price_field] = torch.zeros_like(features[price_field])
-                            elif feature_to_mask == 'time':
-                                # Mask ALL temporal information
-                                for time_field in ['timestamps', 'purchased_timestamps', 'short_term_timestamps', 'long_term_timestamps']:
-                                    if time_field in features:
-                                        features[time_field] = torch.zeros_like(features[time_field])
+                            # Note: Temporal information is no longer a separate view
                             elif feature_to_mask == 'events':
                                 # Mask event-related features in the batch (event_types in enhanced model)
                                 if 'event_types' in features:
@@ -369,6 +438,73 @@ class ComprehensiveMultiViewAnalyzer:
         # Compute metrics
         metrics = metrics_tracker.compute()
         return metrics
+    
+    def _evaluate_by_user_type(self, test_loader):
+        """
+        Evaluate model performance separately for warm-start and cold-start users
+        
+        Returns:
+            Tuple of (warm_start_metrics, cold_start_metrics)
+        """
+        # Get train users from the prepared data  
+        train_users = set()
+        if hasattr(self, 'train_samples') and self.train_samples:
+            train_users = set(sample['user_id'] for sample in self.train_samples)
+            self.train_users = train_users  # Store for later use
+        
+        print(f"Number of train users identified: {len(train_users)}")
+        
+        # Set up metrics trackers
+        warm_metrics_tracker = UnifiedMetricsTracker(k_values=[10, 20])
+        cold_metrics_tracker = UnifiedMetricsTracker(k_values=[10, 20])
+        
+        # Count users by type
+        warm_count = 0
+        cold_count = 0
+        
+        self.model.eval()
+        
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="Evaluating by user type", leave=False):
+                batch = move_batch_to_device(batch, self.device)
+                
+                outputs = self.model(batch)
+                predictions = outputs['predictions']
+                targets = batch['purchased']['package_ids']
+                user_ids = batch['user_id']
+                
+                # Get event indicators
+                is_purchase = batch.get('is_purchase', torch.ones_like(targets, dtype=torch.bool))
+                
+                # Separate by user type
+                warm_start_mask = torch.tensor([uid.item() in train_users for uid in user_ids], device=self.device)
+                cold_start_mask = ~warm_start_mask
+                
+                # Update warm-start metrics
+                if warm_start_mask.any():
+                    warm_count += warm_start_mask.sum().item()
+                    warm_metrics_tracker.update(
+                        predictions=predictions[warm_start_mask],
+                        targets=targets[warm_start_mask],
+                        is_purchase=is_purchase[warm_start_mask]
+                    )
+                
+                # Update cold-start metrics
+                if cold_start_mask.any():
+                    cold_count += cold_start_mask.sum().item()
+                    cold_metrics_tracker.update(
+                        predictions=predictions[cold_start_mask],
+                        targets=targets[cold_start_mask],
+                        is_purchase=is_purchase[cold_start_mask]
+                    )
+        
+        # Compute metrics
+        warm_metrics = warm_metrics_tracker.compute()
+        cold_metrics = cold_metrics_tracker.compute()
+        
+        print(f"Processed {warm_count} warm-start users, {cold_count} cold-start users")
+        
+        return warm_metrics, cold_metrics
     
     def analyze_model_architecture(self) -> pd.DataFrame:
         """
@@ -421,25 +557,24 @@ class ComprehensiveMultiViewAnalyzer:
             if hasattr(self.model.package_encoder, 'price_encoder'):
                 price_params = sum(p.numel() for p in self.model.package_encoder.price_encoder.parameters())
                 
-            # Time encoder parameters (new view)
-            time_params = 0
-            if hasattr(self.model.package_encoder, 'time_encoder'):
-                time_params = sum(p.numel() for p in self.model.package_encoder.time_encoder.parameters())
-                
-            # Events encoder parameters (in package_encoder in enhanced model)
+            # Events encoder parameters
             events_params = 0
-            if hasattr(self.model.package_encoder, 'event_embedding'):
-                events_params += self.model.package_encoder.event_embedding.weight.numel()
-            if hasattr(self.model.package_encoder, 'event_lstm'):
-                events_params += sum(p.numel() for p in self.model.package_encoder.event_lstm.parameters())
-            if hasattr(self.model.package_encoder, 'event_attention'):
-                events_params += sum(p.numel() for p in self.model.package_encoder.event_attention.parameters())
-            if hasattr(self.model.package_encoder, 'event_projection'):
-                events_params += sum(p.numel() for p in self.model.package_encoder.event_projection.parameters())
+            if hasattr(self.model.package_encoder, 'events_encoder'):
+                events_params = sum(p.numel() for p in self.model.package_encoder.events_encoder.parameters())
+            # Otherwise check for individual event components (in enhanced model)
+            else:
+                if hasattr(self.model.package_encoder, 'event_embedding'):
+                    events_params += self.model.package_encoder.event_embedding.weight.numel()
+                if hasattr(self.model.package_encoder, 'event_lstm'):
+                    events_params += sum(p.numel() for p in self.model.package_encoder.event_lstm.parameters())
+                if hasattr(self.model.package_encoder, 'event_attention'):
+                    events_params += sum(p.numel() for p in self.model.package_encoder.event_attention.parameters())
+                if hasattr(self.model.package_encoder, 'event_projection'):
+                    events_params += sum(p.numel() for p in self.model.package_encoder.event_projection.parameters())
             
             # Calculate total and percentages
             total_params = (country_params + category_params + theme_params + 
-                          title_params + coord_params + price_params + time_params + events_params)
+                          title_params + coord_params + price_params + events_params)
             
             if total_params > 0:
                 results.append({
@@ -461,7 +596,7 @@ class ComprehensiveMultiViewAnalyzer:
                     'embedding_dim': country_size
                 })
                 results.append({
-                    'feature': 'Category/Theme (Combined)',
+                    'feature': 'Category/Theme',
                     'parameters': category_params + theme_params,  # Combined parameters
                     'param_percentage': ((category_params + theme_params) / total_params) * 100,
                     'embedding_dim': max(category_size, theme_size)  # Larger of the two
@@ -473,16 +608,10 @@ class ComprehensiveMultiViewAnalyzer:
                     'embedding_dim': self.model_info['config'].get('hidden_dim', 256)  # Output of price_encoder
                 })
                 results.append({
-                    'feature': 'Temporal Information',
-                    'parameters': time_params,
-                    'param_percentage': (time_params / total_params) * 100,
-                    'embedding_dim': self.model_info['config'].get('hidden_dim', 256)  # Output of time_encoder
-                })
-                results.append({
-                    'feature': 'Events/Interactions',
+                    'feature': 'Events',
                     'parameters': events_params,
                     'param_percentage': (events_params / total_params) * 100,
-                    'embedding_dim': self.model_info['config'].get('hidden_dim', 256)  # Output of event components
+                    'embedding_dim': self.model_info['config'].get('hidden_dim', 256)  # Output of events_encoder
                 })
                 
                 print(f"\nParameter allocation analysis:")
@@ -512,7 +641,18 @@ class ComprehensiveMultiViewAnalyzer:
         ax1 = plt.subplot(3, 3, 1)
         if self.ablation_results is not None:
             feature_results = self.ablation_results[self.ablation_results['feature'] != 'Baseline (All Features)'].copy()
-            feature_results = feature_results.sort_values('relative_importance', ascending=True)
+            
+            # Custom sort: Title Embeddings at top, Price at bottom
+            def importance_sort_key(row):
+                if 'Title' in row['feature']:
+                    return 1000 + row['relative_importance']  # Title at top
+                elif 'Price' in row['feature']:
+                    return -1000 + row['relative_importance']  # Price at bottom
+                else:
+                    return row['relative_importance']
+            
+            feature_results['sort_key'] = feature_results.apply(importance_sort_key, axis=1)
+            feature_results = feature_results.sort_values('sort_key', ascending=True)
             
             bars = ax1.barh(feature_results['feature'], feature_results['relative_importance'], 
                            color=colors[:len(feature_results)])
@@ -550,29 +690,36 @@ class ComprehensiveMultiViewAnalyzer:
             ax2.set_xticklabels(feature_results['feature'], rotation=45, ha='right')
             ax2.legend()
         
-        # 3. Parameter Allocation Pie Chart
+        # 3. Parameter Allocation Histogram
         ax3 = plt.subplot(3, 3, 3)
         if self.architecture_analysis is not None:
             param_df = self.architecture_analysis[self.architecture_analysis['parameters'] > 0].copy()
             
+            # Fix duplicate Events/Interactions and rename Category/Theme
+            param_df['feature'] = param_df['feature'].replace({
+                'Events/Interactions': 'Events',
+                'Category/Theme (Combined)': 'Category/Theme'
+            })
+            
+            # Remove duplicates by grouping
+            param_df = param_df.groupby('feature').agg({
+                'parameters': 'sum',
+                'param_percentage': 'sum',
+                'embedding_dim': 'first'
+            }).reset_index()
+            
             if not param_df.empty:
-                wedges, texts, autotexts = ax3.pie(
-                    param_df['param_percentage'], 
-                    labels=param_df['feature'],
-                    autopct='%1.1f%%',
-                    startangle=90,
-                    colors=colors[:len(param_df)]
-                )
-                
+                bars = ax3.bar(range(len(param_df)), param_df['param_percentage'], 
+                              color=colors[:len(param_df)])
+                ax3.set_xticks(range(len(param_df)))
+                ax3.set_xticklabels(param_df['feature'], rotation=45, ha='right')
+                ax3.set_ylabel('Parameter Percentage (%)')
                 ax3.set_title('Model Capacity Allocation\n(% of Feature Parameters)', fontweight='bold')
                 
-                # Enhance text
-                for text in texts:
-                    text.set_fontsize(9)
-                for autotext in autotexts:
-                    autotext.set_fontsize(8)
-                    autotext.set_color('white')
-                    autotext.set_fontweight('bold')
+                # Add value labels on bars
+                for bar, pct in zip(bars, param_df['param_percentage']):
+                    ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                            f'{pct:.1f}%', ha='center', va='bottom', fontsize=9)
         
         # 4. Embedding Dimensions Comparison
         ax4 = plt.subplot(3, 3, 4)
@@ -885,6 +1032,449 @@ class ComprehensiveMultiViewAnalyzer:
         print(f"\nView influence visualization saved to: {output_path}")
         
         return fig
+
+    def analyze_attention_weights(self, num_samples=500):
+        """Analyze attention weights across views for warm-start users only"""
+        
+        print(f"\n{'='*60}")
+        print("🔍 ANALYZING VIEW ATTENTION WEIGHTS (WARM-START USERS ONLY)")
+        print(f"{'='*60}")
+        
+        # Get train users to identify warm-start users
+        if not hasattr(self, 'train_users') or self.train_users is None:
+            print("Warning: No train_users available. Must run ablation study first to identify warm-start users.")
+            print("Falling back to collecting attention weights from all users.")
+            self.train_users = set()  # Empty set means we'll skip warm-start filtering
+        
+        if len(self.train_users) > 0:
+            print(f"Using {len(self.train_users)} training users for warm-start filtering")
+        else:
+            print("No warm-start filtering applied - using all test users")
+        
+        # Enable debug mode to capture attention weights
+        self.model.enable_debug(True)
+        
+        attention_data = []
+        view_names = list(self.feature_groups.values())
+        warm_start_samples = 0
+        total_samples = 0
+        
+        # Create a separate dataloader with only warm-start users if available
+        if len(self.train_users) > 0 and hasattr(self, 'warm_start_purchases'):
+            print(f"Creating dataloader with {len(self.warm_start_purchases)} warm-start purchases")
+            
+            # Debug: Check user IDs
+            warm_user_ids = set(p['user_id'] for p in self.warm_start_purchases)
+            print(f"Warm-start purchase user IDs sample: {list(warm_user_ids)[:5]}")
+            print(f"Train user IDs sample: {list(self.train_users)[:5]}")
+            print(f"Overlap check: {len(warm_user_ids.intersection(self.train_users))} users in common")
+            
+            # Create dataloader with only warm-start purchases
+            from utils.training_utils import create_dataloaders
+            dummy_train = self.warm_start_purchases[:100] if len(self.warm_start_purchases) > 100 else self.warm_start_purchases
+            
+            _, warm_test_loader = create_dataloaders(
+                train_samples=dummy_train,
+                test_samples=self.warm_start_purchases,
+                package_processor=self.package_processor,
+                session_processor=self.session_processor,
+                batch_size=64,
+                num_workers=0,
+                use_weighted_sampling=False
+            )
+            
+            attention_test_loader = warm_test_loader
+            using_warm_start_only = True
+            print(f"Using warm-start only dataloader with {len(self.warm_start_purchases)} samples")
+        else:
+            attention_test_loader = self.test_loader
+            using_warm_start_only = False
+            print("Using original test_loader (all users)")
+        
+        with torch.no_grad():
+            sample_count = 0
+            for batch in tqdm(attention_test_loader, desc="Collecting attention weights"):
+                if sample_count >= num_samples:
+                    break
+                
+                # Move batch to device
+                batch = move_batch_to_device(batch, self.device)
+                
+                # Forward pass to generate attention weights
+                outputs = self.model(batch)
+                
+                # Extract view-level attention weights from model
+                for module in self.model.modules():
+                    if hasattr(module, 'last_attention_weights') and module.last_attention_weights is not None:
+                        # Get the attention weights [batch_size, num_views]
+                        weights = module.last_attention_weights
+                        
+                        # Handle different attention weight formats
+                        if weights.dim() == 4:  # [batch, heads, seq, views]
+                            weights = weights.mean(dim=1).squeeze(1)  # Average over heads and sequence
+                        elif weights.dim() == 3:  # [batch, seq, views]
+                            weights = weights.squeeze(1)  # Remove sequence dimension
+                        
+                                # Store attention weights only for warm-start users
+                        for i in range(weights.shape[0]):
+                            user_id = batch['user_id'][i].item()
+                            total_samples += 1
+                            
+                            # Debug first few users
+                            if total_samples <= 5:
+                                print(f"Debug - User ID: {user_id}, In train_users: {user_id in self.train_users}")
+                            
+                            # If using warm-start only dataloader, all users are warm-start
+                            if using_warm_start_only or user_id in self.train_users:
+                                warm_start_samples += 1
+                                sample_weights = weights[i].cpu().numpy()
+                                for j, weight in enumerate(sample_weights):
+                                    if j < len(view_names):  # Ensure we don't exceed view count
+                                        attention_data.append({
+                                            'user_id': user_id,
+                                            'view': view_names[j],
+                                            'attention_weight': weight.item()
+                                        })
+                
+                sample_count += batch['user_id'].shape[0]
+        
+        # Disable debug mode
+        self.model.enable_debug(False)
+        
+        print(f"Processed {total_samples} total samples, {warm_start_samples} warm-start samples")
+        print(f"Warm-start ratio: {warm_start_samples/max(total_samples,1)*100:.1f}%")
+        
+        if attention_data:
+            df = pd.DataFrame(attention_data)
+            print(f"Collected {len(df)} attention weight data points from warm-start users")
+            return df
+        else:
+            print("Warning: No attention weights captured from warm-start users")
+            return None
+
+    def create_attention_analysis(self):
+        """Create attention weight analysis with boxplots"""
+        
+        # Collect attention weights
+        attention_df = self.analyze_attention_weights()
+        
+        if attention_df is None:
+            print("No attention data to analyze")
+            return None
+        
+        # Create figure with attention analysis
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        
+        # Boxplot of attention weights per view
+        import seaborn as sns
+        sns.boxplot(data=attention_df, x='view', y='attention_weight', ax=ax1)
+        ax1.set_title('View Attention Weight Distribution\n(Higher = More Important)', fontsize=14, fontweight='bold')
+        ax1.set_xlabel('Views', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('Attention Weight', fontsize=12, fontweight='bold')
+        ax1.tick_params(axis='x', rotation=45)
+        ax1.grid(axis='y', alpha=0.3)
+        
+        # Mean attention weights with confidence intervals
+        view_stats = attention_df.groupby('view')['attention_weight'].agg(['mean', 'std', 'count']).reset_index()
+        view_stats['sem'] = view_stats['std'] / np.sqrt(view_stats['count'])  # Standard error
+        view_stats = view_stats.sort_values('mean', ascending=True)
+        
+        y_pos = np.arange(len(view_stats))
+        bars = ax2.barh(y_pos, view_stats['mean'], 
+                       xerr=view_stats['sem'], 
+                       color=['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57', '#54A0FF'][:len(view_stats)],
+                       alpha=0.8, capsize=5)
+        
+        ax2.set_yticks(y_pos)
+        ax2.set_yticklabels(view_stats['view'], fontsize=11)
+        ax2.set_xlabel('Mean Attention Weight (±SE)', fontsize=12, fontweight='bold')
+        ax2.set_title('Average View Importance\n(Across All Users)', fontsize=14, fontweight='bold')
+        ax2.grid(axis='x', alpha=0.3)
+        
+        # Add value labels
+        for i, bar in enumerate(bars):
+            width = bar.get_width()
+            ax2.text(width + view_stats['sem'].iloc[i] + 0.01, bar.get_y() + bar.get_height()/2, 
+                    f'{width:.3f}', ha='left', va='center', fontweight='bold')
+        
+        plt.suptitle('Multi-View Attention Analysis', fontsize=16, fontweight='bold', y=0.98)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # Save plot
+        output_dir = 'output/analyze_learning'
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, 'attention_analysis.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"\nAttention analysis saved to: {output_path}")
+        
+        return fig, attention_df
+
+    def create_simplified_view_analysis(self):
+        """Create simplified 2-graph analysis showing view performance and contribution"""
+        
+        print(f"\n{'='*60}")
+        print("🎨 CREATING SIMPLIFIED VIEW ANALYSIS")
+        print(f"{'='*60}")
+        
+        # Set style
+        plt.style.use('seaborn-v0_8-whitegrid')
+        view_colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57', '#54A0FF']
+        
+        # Create figure with 2 subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        
+        # Graph 1: View Performance Impact (when removed)
+        if self.ablation_results is not None:
+            feature_results = self.ablation_results[self.ablation_results['feature'] != 'Baseline (All Features)'].copy()
+            feature_results = feature_results.sort_values('recall@20_drop', ascending=True)
+            
+            y_pos = np.arange(len(feature_results))
+            bars1 = ax1.barh(y_pos, feature_results['recall@20_drop'] * 100, 
+                           color=view_colors[:len(feature_results)], alpha=0.8, edgecolor='black')
+            
+            ax1.set_yticks(y_pos)
+            ax1.set_yticklabels(feature_results['feature'], fontsize=11)
+            ax1.set_xlabel('Performance Drop when Removed (%)', fontsize=12, fontweight='bold')
+            ax1.set_title('View Importance\n(Higher = More Important)', fontsize=14, fontweight='bold')
+            ax1.grid(axis='x', alpha=0.3)
+            
+            # Add value labels on bars
+            for i, bar in enumerate(bars1):
+                width = bar.get_width()
+                ax1.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
+                        f'{width:.1f}%', ha='left', va='center', fontweight='bold')
+        
+        # Graph 2: View Parameter Allocation vs Performance Impact
+        if self.ablation_results is not None and self.architecture_analysis is not None:
+            # Merge data
+            feature_results = self.ablation_results[self.ablation_results['feature'] != 'Baseline (All Features)'].copy()
+            arch_results = self.architecture_analysis[self.architecture_analysis['parameters'] > 0].copy()
+            
+            merged_df = pd.merge(
+                feature_results[['feature', 'recall@20_drop', 'relative_importance']], 
+                arch_results[['feature', 'param_percentage']], 
+                on='feature', how='inner'
+            )
+            
+            if not merged_df.empty:
+                scatter = ax2.scatter(merged_df['param_percentage'], 
+                                    merged_df['recall@20_drop'] * 100,
+                                    c=view_colors[:len(merged_df)], 
+                                    s=200, alpha=0.8, edgecolors='black', linewidth=2)
+                
+                # Add labels for each point
+                for i, row in merged_df.iterrows():
+                    ax2.annotate(row['feature'], 
+                               (row['param_percentage'], row['recall@20_drop'] * 100),
+                               xytext=(5, 5), textcoords='offset points', 
+                               fontsize=10, fontweight='bold')
+                
+                ax2.set_xlabel('Parameter Allocation (%)', fontsize=12, fontweight='bold')
+                ax2.set_ylabel('Performance Drop when Removed (%)', fontsize=12, fontweight='bold')
+                ax2.set_title('Parameter Efficiency\n(Top-right = Most Important)', fontsize=14, fontweight='bold')
+                ax2.grid(True, alpha=0.3)
+                
+                # Add diagonal reference line
+                max_val = max(merged_df['param_percentage'].max(), merged_df['recall@20_drop'].max() * 100)
+                ax2.plot([0, max_val], [0, max_val], 'r--', alpha=0.5, label='Equal efficiency line')
+                ax2.legend()
+        
+        # Get model name for title
+        model_name = os.path.basename(self.model_info.get('checkpoint_path', 'Unknown Model'))
+        
+        plt.suptitle(f'Multi-View Performance Analysis: {model_name}', 
+                    fontsize=16, fontweight='bold', y=0.98)
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # Save plot
+        output_dir = 'output/analyze_learning'
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, 'simplified_view_analysis.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"\nSimplified view analysis saved to: {output_path}")
+        
+        return fig
+    
+    def create_feature_importance_graph(self):
+        """Create feature importance graph showing performance drop when features are removed"""
+        
+        print(f"\n{'='*60}")
+        print("🎨 CREATING FEATURE IMPORTANCE ANALYSIS")
+        print(f"{'='*60}")
+        
+        if self.ablation_results is None:
+            raise ValueError("Must run ablation study first")
+        
+        # Create figure
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        
+        # Left plot: Feature importance (performance drop)
+        feature_names = []
+        performance_drops = []
+        
+        for _, row in self.ablation_results.iterrows():
+            if row['feature'] != 'Baseline (All Features)':
+                feature_names.append(row['feature'])
+                performance_drops.append(row['recall@20_drop'] * 100)  # Convert to percentage
+        
+        # Sort by performance drop from highest to lowest
+        # For horizontal bar plots, the first item appears at the bottom
+        # So we sort in ascending order to get highest values at the top
+        sorted_data = sorted(zip(feature_names, performance_drops), key=lambda x: x[1])
+        feature_names, performance_drops = zip(*sorted_data)
+        
+        # Create horizontal bar plot
+        colors = plt.cm.viridis(np.linspace(0, 1, len(feature_names)))
+        bars = ax1.barh(range(len(feature_names)), performance_drops, color=colors)
+        
+        ax1.set_yticks(range(len(feature_names)))
+        ax1.set_yticklabels(feature_names)
+        ax1.set_xlabel('Performance Drop (%)', fontsize=12)
+        ax1.set_title('Feature Importance\n(Recall@20 Drop When Removed)', fontsize=14, fontweight='bold')
+        ax1.grid(axis='x', alpha=0.3)
+        
+        # Add value labels on bars
+        for i, (bar, val) in enumerate(zip(bars, performance_drops)):
+            ax1.text(val + 1, bar.get_y() + bar.get_height()/2, f'{val:.1f}%', 
+                    va='center', fontsize=11, fontweight='bold')
+        
+        # Right plot: Feature embedding dimensions (histogram)
+        if self.architecture_analysis is not None:
+            feature_params = []
+            param_percentages = []
+            
+            # Clean up the data first - remove duplicates and rename
+            arch_df = self.architecture_analysis.copy()
+            arch_df['feature'] = arch_df['feature'].replace({
+                'Events/Interactions': 'Events',
+                'Category/Theme (Combined)': 'Category/Theme'
+            })
+            
+            # Group by feature to remove duplicates
+            arch_df = arch_df.groupby('feature').agg({
+                'param_percentage': 'sum',
+                'parameters': 'sum'
+            }).reset_index()
+            
+            for _, row in arch_df.iterrows():
+                feature_params.append(row['feature'])
+                param_percentages.append(row['param_percentage'])
+            
+            # Sort by parameter percentage (descending)
+            sorted_data = sorted(zip(feature_params, param_percentages), key=lambda x: x[1], reverse=True)
+            feature_params, param_percentages = zip(*sorted_data)
+            
+            # Create histogram (vertical bar chart)
+            colors_hist = plt.cm.Set3(np.linspace(0, 1, len(feature_params)))
+            # Get actual parameter counts for y-axis
+            actual_params = []
+            for feature in feature_params:
+                row = arch_df[arch_df['feature'] == feature].iloc[0]
+                actual_params.append(row['parameters'])
+            
+            bars = ax2.bar(range(len(feature_params)), actual_params, color=colors_hist, alpha=0.7, edgecolor='black')
+            
+            ax2.set_xticks(range(len(feature_params)))
+            ax2.set_xticklabels(feature_params, rotation=45, ha='right')
+            ax2.set_ylabel('Number of Parameters', fontsize=12)
+            ax2.set_title('Feature Embedding Dimensions\n(Parameter Count & Allocation)', fontsize=14, fontweight='bold')
+            ax2.grid(axis='y', alpha=0.3)
+            
+            # Format y-axis to show parameter counts nicely
+            ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'))
+            
+            # Add percentage labels on bars
+            for i, (bar, val, params) in enumerate(zip(bars, param_percentages, actual_params)):
+                ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5000, f'{val:.1f}%', 
+                        ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        plt.tight_layout()
+        
+        # Save plot
+        os.makedirs('output/analyze_learning', exist_ok=True)
+        save_path = 'output/analyze_learning/feature_importance_analysis.png'
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Feature importance analysis saved to: {save_path}")
+        
+        return fig
+    
+    def create_attention_boxplot(self):
+        """Create boxplot showing attention weight distributions across views for warm-start users"""
+        
+        print(f"\n{'='*60}")
+        print("🔍 ANALYZING VIEW ATTENTION WEIGHTS (WARM-START USERS)")
+        print(f"{'='*60}")
+        
+        # Collect attention weights with more samples for warm-start users only
+        attention_df = self.analyze_attention_weights(num_samples=1000)
+        
+        if attention_df is None or attention_df.empty:
+            print("No attention weights collected from warm-start users")
+            return None
+        
+        # Print some statistics to understand the data
+        print(f"Collected {len(attention_df)} attention weight samples from warm-start users")
+        print(f"Attention weight range: {attention_df['attention_weight'].min():.6f} to {attention_df['attention_weight'].max():.6f}")
+        print(f"Attention weight std: {attention_df['attention_weight'].std():.6f}")
+        
+        # Create larger figure with better spacing
+        fig, ax = plt.subplots(figsize=(14, 10))
+        
+        view_names = list(self.feature_groups.values())
+        attention_data = [attention_df[attention_df['view'] == view]['attention_weight'].values 
+                         for view in view_names if view in attention_df['view'].values]
+        view_labels = [view for view in view_names if view in attention_df['view'].values]
+        
+        # Print view-specific statistics
+        for view, data in zip(view_labels, attention_data):
+            if len(data) > 0:
+                print(f"{view}: mean={data.mean():.6f}, std={data.std():.6f}, range=[{data.min():.6f}, {data.max():.6f}]")
+        
+        # Create enhanced boxplot with better visibility
+        box_plot = ax.boxplot(attention_data, labels=view_labels, patch_artist=True, 
+                             widths=0.6, showfliers=True, notch=True, 
+                             flierprops=dict(marker='o', markerfacecolor='red', markersize=4, alpha=0.6),
+                             medianprops=dict(color='black', linewidth=2),
+                             boxprops=dict(linewidth=1.5),
+                             whiskerprops=dict(linewidth=1.5),
+                             capprops=dict(linewidth=1.5))
+        
+        # Color the boxes with more vibrant colors
+        colors = plt.cm.tab10(np.linspace(0, 1, len(box_plot['boxes'])))
+        for patch, color in zip(box_plot['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.8)
+            patch.set_edgecolor('black')
+        
+        # Improve axes and labels
+        ax.set_xlabel('Feature Views', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Attention Weight', fontsize=14, fontweight='bold')
+        ax.set_title('Attention Weight Distribution Across Views\n(Warm-Start Users Only)', 
+                    fontsize=16, fontweight='bold', pad=20)
+        
+        # Enhance grid and formatting
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.tick_params(axis='both', which='major', labelsize=12)
+        
+        # Try different y-axis scaling if the range is very small
+        y_range = attention_df['attention_weight'].max() - attention_df['attention_weight'].min()
+        if y_range < 0.01:  # If range is very small, zoom in
+            mean_val = attention_df['attention_weight'].mean()
+            ax.set_ylim(mean_val - 3*attention_df['attention_weight'].std(), 
+                       mean_val + 3*attention_df['attention_weight'].std())
+        
+        # Rotate x-axis labels for better readability
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        
+        # Save plot
+        os.makedirs('output/analyze_learning', exist_ok=True)
+        save_path = 'output/analyze_learning/attention_boxplot.png'
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Attention boxplot saved to: {save_path}")
+        
+        return fig
     
     def _generate_insights_text(self) -> str:
         """Generate insights text based on analysis results"""
@@ -960,11 +1550,16 @@ class ComprehensiveMultiViewAnalyzer:
         # 2. Analyze model architecture
         self.analyze_model_architecture()
         
-        # 3. Create comprehensive visualization
-        self.create_comprehensive_visualization()
+        # 3. Create feature importance graph
+        self.create_feature_importance_graph()
         
-        # 4. Create focused view influence graph
-        self.create_view_influence_graph()
+        # 4. Create attention boxplot (skip if there are errors)
+        try:
+            self.create_attention_boxplot()
+        except Exception as e:
+            print(f"Skipping attention analysis due to error: {e}")
+            import traceback
+            traceback.print_exc()
         
         # 5. Save all results
         self.save_results()
@@ -973,8 +1568,8 @@ class ComprehensiveMultiViewAnalyzer:
         print("ANALYSIS COMPLETE!")
         print(f"{'='*80}")
         print("Generated files in output/analyze_learning/:")
-        print("- comprehensive_multiview_analysis.png (full analysis)")
-        print("- view_influence_analysis.png (focused view influence graph)")
+        print("- feature_importance_analysis.png (feature importance)")
+        print("- attention_boxplot.png (attention weights)")
         print("- multiview_ablation_results.csv (ablation study data)")
         print("- multiview_architecture_analysis.csv (architecture data)")
 
@@ -985,6 +1580,8 @@ def main():
     )
     parser.add_argument('--model-info', type=str, required=True,
                         help='Path to model_info.json file')
+    parser.add_argument('--checkpoint', type=str, required=True,
+                        help='Path to model checkpoint file (.pth)')
     parser.add_argument('--sample-size', type=int, default=None,
                         help='Number of samples for ablation analysis (default: all purchases)')
     
@@ -995,10 +1592,16 @@ def main():
         print(f"Error: Model info file not found: {args.model_info}")
         return 1
     
+    # Validate checkpoint file
+    if not os.path.exists(args.checkpoint):
+        print(f"Error: Model checkpoint file not found: {args.checkpoint}")
+        return 1
+    
     try:
         # Initialize analyzer
         analyzer = ComprehensiveMultiViewAnalyzer(
             model_info_path=args.model_info,
+            checkpoint_path=args.checkpoint,
             sample_size=args.sample_size
         )
         

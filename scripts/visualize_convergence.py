@@ -37,8 +37,8 @@ def create_convergence_plots(metrics_data, output_dir):
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    # Create figure with 4 subplots vertically
-    fig, axes = plt.subplots(4, 1, figsize=(10, 16))
+    # Create figure with 3 subplots vertically (removed purchase_recall@10)
+    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
     fig.suptitle('Test Set Performance Convergence Comparison', fontsize=16, y=0.995)
     
     # Define colors and line styles for different models
@@ -56,12 +56,11 @@ def create_convergence_plots(metrics_data, output_dir):
         'NATR Pre-train + Fine-tune': '-'
     }
     
-    # Metrics to plot
+    # Metrics to plot (removed purchase_recall@10)
     metrics = [
         ('purchase_recall@20', 'Purchase Recall@20 (%)', axes[0]),
-        ('purchase_recall@10', 'Purchase Recall@10 (%)', axes[1]),
-        ('item_coverage@20', 'Item Coverage@20 (%)', axes[2]),
-        ('purchase_mrr', 'Purchase MRR', axes[3])
+        ('item_coverage@20', 'Item Coverage@20 (%)', axes[1]),
+        ('purchase_mrr', 'Purchase MRR', axes[2])
     ]
     
     # Plot each metric
@@ -128,49 +127,6 @@ def create_convergence_plots(metrics_data, output_dir):
     plt.savefig(pdf_path, format='pdf', bbox_inches='tight')
     print(f"📊 Saved PDF version to: {pdf_path}")
     
-    # Also create individual plots for each metric
-    for metric_key, metric_name, _ in metrics:
-        fig_single, ax_single = plt.subplots(1, 1, figsize=(8, 6))
-        
-        for model_name, history in metrics_data.items():
-            if not history:
-                continue
-                
-            epochs = [m.get('epoch', i+1) for i, m in enumerate(history)]
-            
-            if metric_key == 'purchase_mrr':
-                values = [m.get(metric_key, 0) for m in history]
-            else:
-                values = [m.get(metric_key, 0) * 100 if m.get(metric_key, 0) <= 1 else m.get(metric_key, 0) 
-                         for m in history]
-            
-            ax_single.plot(epochs, values,
-                          label=model_name,
-                          color=colors.get(model_name, 'black'),
-                          linestyle=line_styles.get(model_name, '-'),
-                          linewidth=2.5,
-                          marker='o' if len(epochs) < 20 else None,
-                          markersize=5,
-                          alpha=0.9)
-        
-        ax_single.set_xlabel('Epoch', fontsize=14)
-        ax_single.set_ylabel(metric_name, fontsize=14)
-        ax_single.set_title(f'{metric_name} Convergence', fontsize=16)
-        ax_single.grid(True, alpha=0.3)
-        ax_single.legend(loc='best', framealpha=0.9, fontsize=11)
-        
-        if 'Recall' in metric_name or 'Coverage' in metric_name:
-            ax_single.set_ylim(0, max(ax_single.get_ylim()[1], 100))
-        
-        plt.tight_layout()
-        
-        # Save individual metric plot
-        metric_filename = metric_key.replace('@', '_at_').replace(' ', '_')
-        single_path = os.path.join(output_dir, f'{metric_filename}_convergence_{timestamp}.png')
-        plt.savefig(single_path, dpi=300, bbox_inches='tight')
-        plt.close(fig_single)
-        print(f"📊 Saved {metric_name} plot to: {single_path}")
-    
     plt.close(fig)
 
 def create_metrics_summary_table(metrics_data, output_dir):
@@ -233,12 +189,12 @@ def main():
     # Load available metrics files
     metrics_data = {}
     
-    # Expected files and their model names
+    # Expected files and their model names for 13 months data
     expected_files = {
-        'natr_baseline_metrics_history2.json': 'NATR Baseline',
-        'natr_oversampled_metrics_history2.json': 'NATR Oversampled',
-        'natr_sampled_softmax_metrics_history2.json': 'NATR Negative Sampling',
-        'natr_enhanced_pretrain_finetune_metrics_history2.json': 'NATR Pre-train + Fine-tune'
+        'natr_baseline_metrics_history13.json': 'NATR Baseline',
+        'natr_oversampled_metrics_history13.json': 'NATR Oversampled', 
+        'natr_sampled_softmax_metrics_history13.json': 'NATR Negative Sampling',
+        'natr_enhanced_pretrain_finetune_metrics_history13.json': 'NATR Pre-train + Fine-tune'
     }
     
     # Also check for CSV files from train_natr_enhanced_pre_finetune_fixed.py
@@ -272,9 +228,6 @@ def main():
     
     # Create visualizations
     create_convergence_plots(metrics_data, graphs_data_dir)
-    
-    # Create summary table
-    create_metrics_summary_table(metrics_data, graphs_data_dir)
     
     print("\n✅ Visualization complete! Check output/graphs_data/ for results.")
 
