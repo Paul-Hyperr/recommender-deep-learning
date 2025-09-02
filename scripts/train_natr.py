@@ -553,6 +553,7 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None, 
     best_purchase_mrr = 0.0
     patience = 10 if performance_mode != "fastest" else 5
     epochs_without_improvement = 0
+    previous_checkpoint = None  # Track previous checkpoint for cleanup
     
     for epoch in range(num_epochs):
         print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
@@ -609,7 +610,17 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None, 
             best_purchase_mrr = current_purchase_mrr
             epochs_without_improvement = 0
             
-            # Save best model
+            # Save best model with performance in filename
+            # Format recall with 2 decimals (e.g., 74_11 for 74.11%)
+            recall_whole = int(best_purchase_recall * 100)
+            recall_decimal = int((best_purchase_recall * 10000) % 100)
+            checkpoint_filename = f'checkpoints/natr/best_model_{model_name}_recall{recall_whole:02d}_{recall_decimal:02d}.pth'
+            
+            # Delete previous checkpoint if it exists
+            if previous_checkpoint and os.path.exists(previous_checkpoint):
+                os.remove(previous_checkpoint)
+                print(f"  Removed previous checkpoint: {os.path.basename(previous_checkpoint)}")
+            
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -617,8 +628,12 @@ def main(performance_mode="balanced", dataset="13months", event_data_path=None, 
                 'config': config.__dict__,
                 'metrics': metrics,
                 'train_loss': train_loss
-            }, f'checkpoints/natr/best_model_{model_name}.pth')
-            print(f"✓ New best model saved! Purchase Recall@20: {best_purchase_recall*100:.2f}%, Purchase MRR: {best_purchase_mrr:.4f}")
+            }, checkpoint_filename)
+            print(f"✓ New best model saved to {checkpoint_filename}")
+            print(f"  Purchase Recall@20: {best_purchase_recall*100:.2f}%, Purchase MRR: {best_purchase_mrr:.4f}")
+            
+            # Update previous checkpoint tracker
+            previous_checkpoint = checkpoint_filename
         else:
             epochs_without_improvement += 1
             print(f"No improvement for {epochs_without_improvement} epoch(s)")

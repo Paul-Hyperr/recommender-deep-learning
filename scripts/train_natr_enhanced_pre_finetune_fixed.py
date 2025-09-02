@@ -901,6 +901,8 @@ def main(performance_config=None, dataset="13months", event_data_path=None):
     best_mrr = 0.0
     best_item_coverage = 0.0
     training_results = []
+    previous_pretrain_checkpoint = None  # Track previous pretrain checkpoint for cleanup
+    previous_finetune_checkpoint = None  # Track previous finetune checkpoint for cleanup
     
     # Metrics tracking for visualization
     pretrain_metrics_history = []
@@ -1007,15 +1009,30 @@ def main(performance_config=None, dataset="13months", event_data_path=None):
                 best_mrr = current_mrr
                 best_item_coverage = current_item_coverage
                 
+                # Save with performance in filename
+                # Format recall with 2 decimals (e.g., 74_11 for 74.11%)
+                recall_whole = int(best_purchase_recall * 100)
+                recall_decimal = int((best_purchase_recall * 10000) % 100)
+                pretrain_checkpoint = f'checkpoints/natr_enhanced/pretrained_model_recall{recall_whole:02d}_{recall_decimal:02d}.pth'
+                
+                # Delete previous checkpoint if it exists
+                if previous_pretrain_checkpoint and os.path.exists(previous_pretrain_checkpoint):
+                    os.remove(previous_pretrain_checkpoint)
+                    print(f"  Removed previous checkpoint: {os.path.basename(previous_pretrain_checkpoint)}")
+                
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': pretrain_optimizer.state_dict(),
                     'epoch': epoch,
                     'metrics': metrics,
                     'config': config.__dict__
-                }, 'checkpoints/natr_enhanced/pretrained_model.pth')
+                }, pretrain_checkpoint)
                 
-                print(f"💾 Saved best pre-training model (Purchase Recall@20: {current_purchase_recall*100:.2f}%)")
+                print(f"💾 Saved best pre-training model to {pretrain_checkpoint}")
+                print(f"   Purchase Recall@20: {current_purchase_recall*100:.2f}%")
+                
+                # Update tracker
+                previous_pretrain_checkpoint = pretrain_checkpoint
     
     pretrain_time = time.time() - pretrain_start_time
     print(f"\nPre-training completed in {pretrain_time/60:.1f} minutes")
@@ -1122,16 +1139,30 @@ def main(performance_config=None, dataset="13months", event_data_path=None):
                 best_item_coverage = current_item_coverage
                 patience_counter = 0
                 
-                # Save best model
+                # Save best model with performance in filename
+                # Format recall with 2 decimals (e.g., 74_11 for 74.11%)
+                recall_whole = int(best_purchase_recall * 100)
+                recall_decimal = int((best_purchase_recall * 10000) % 100)
+                finetune_checkpoint = f'checkpoints/natr_enhanced/finetuned_model_recall{recall_whole:02d}_{recall_decimal:02d}.pth'
+                
+                # Delete previous checkpoint if it exists
+                if previous_finetune_checkpoint and os.path.exists(previous_finetune_checkpoint):
+                    os.remove(previous_finetune_checkpoint)
+                    print(f"  Removed previous checkpoint: {os.path.basename(previous_finetune_checkpoint)}")
+                
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': finetune_optimizer.state_dict(),
                     'epoch': epoch + pretrain_epochs,
                     'metrics': metrics,
                     'config': config.__dict__
-                }, 'checkpoints/natr_enhanced/finetuned_model.pth')
+                }, finetune_checkpoint)
                 
-                print(f"💾 Saved best fine-tuned model (Purchase Recall@20: {current_purchase_recall*100:.2f}%)")
+                print(f"💾 Saved best fine-tuned model to {finetune_checkpoint}")
+                print(f"   Purchase Recall@20: {current_purchase_recall*100:.2f}%")
+                
+                # Update tracker
+                previous_finetune_checkpoint = finetune_checkpoint
             else:
                 patience_counter += 1
                 print(f"⏳ No improvement for {patience_counter} evaluation(s)")
@@ -1190,7 +1221,9 @@ def main(performance_config=None, dataset="13months", event_data_path=None):
             'recent_popularity_boost_20days',
             'intent_based_sampling',
             'pretrain_finetune'
-        ]
+        ],
+        'pretrain_checkpoint_path': pretrain_checkpoint,
+        'finetune_checkpoint_path': finetune_checkpoint
     }
     
     # Save model info to appropriate directory
@@ -1201,9 +1234,9 @@ def main(performance_config=None, dataset="13months", event_data_path=None):
         json.dump(model_info, f, indent=2)
     
     print("\nFiles saved:")
-    print("  - checkpoints/natr_enhanced/pretrained_model.pth")
-    print("  - checkpoints/natr_enhanced/finetuned_model.pth")  
-    print("  - output/model_info/model_info_enhanced_pretrain_finetune.json")
+    print(f"  - {pretrain_checkpoint}")
+    print(f"  - {finetune_checkpoint}")  
+    print(f"  - {output_dir}/model_info_enhanced_pretrain_finetune.json")
     
     # Create visualization of purchase recall convergence
     print("\n📊 Creating purchase recall convergence visualization...")
